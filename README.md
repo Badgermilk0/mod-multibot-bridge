@@ -117,9 +117,10 @@ The bridge then answers with structured payloads that the addon can consume dire
 
 ## Server
 
-- AzerothCore WotLK.
+- [`AzerothCore WotLK`](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot).
 - AzerothCore source build environment.
-- `mod-playerbots` installed and working.
+- [`mod-playerbots`](https://github.com/mod-playerbots/mod-playerbots).
+- [`MultiBot-Chatless`]([https://github.com/mod-playerbots/mod-playerbots](https://github.com/Wishmaster117/MultiBot-Chatless).
 - Ability to rebuild the server after adding a module.
 
 ## Client
