@@ -3,6 +3,7 @@
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "ChatHelper.h"
+#include "Group.h"
 #include "Item.h"
 #include "ItemPackets.h"
 #include "ObjectMgr.h"
@@ -1570,6 +1571,92 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
     SendAddonPacket(requester, replyType, "OUTFITS_CMD", payload.str());
 }
 
+bool IsAllowedRTIIcon(std::string const& value)
+{
+    static std::set<std::string> const allowed = { "STAR", "CIRCLE", "DIAMOND", "TRIANGLE", "MOON", "SQUARE", "CROSS", "SKULL" };
+    return allowed.find(ToUpper(Trim(value))) != allowed.end();
+}
+
+bool IsAllowedRTICommand(std::string const& command)
+{
+    std::istringstream in(ToUpper(Trim(command)));
+    std::vector<std::string> parts;
+    std::string part;
+
+    while (in >> part)
+        parts.push_back(part);
+
+    if (parts.size() == 3 && (parts[0] == "ATTACK" || parts[0] == "PULL") && parts[1] == "RTI" && parts[2] == "TARGET")
+        return true;
+
+    if (parts.size() == 2 && parts[0] == "RTI" && IsAllowedRTIIcon(parts[1]))
+        return true;
+
+    if (parts.size() == 3 && parts[0] == "RTI" && parts[1] == "CC" && IsAllowedRTIIcon(parts[2]))
+        return true;
+
+    return false;
+}
+
+bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
+{
+    if (!requester || !bot)
+        return false;
+
+    if (scope == "ALL")
+        return true;
+
+    if (scope == "BOT")
+        return bot->GetName() == target;
+
+    if (scope == "GROUP")
+    {
+        uint32 groupNumber = static_cast<uint32>(std::strtoul(target.c_str(), nullptr, 10));
+        if (groupNumber < 1 || groupNumber > 8)
+            return false;
+
+        Group* const group = requester->GetGroup();
+        if (!group || bot->GetGroup() != group)
+            return false;
+
+        return group->GetMemberGroup(bot->GetGUID()) == groupNumber - 1;
+    }
+
+    return false;
+}
+
+void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const command = Trim(UrlDecodeField(encodedCommand));
+    uint32 executed = 0;
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (mgr && IsAllowedRTICommand(command) && (scope == "ALL" || scope == "GROUP" || scope == "BOT"))
+    {
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        {
+            Player* const bot = it->second;
+            if (!BotMatchesRTIScope(requester, bot, scope, target))
+                continue;
+
+            if (ExecuteSilentBotCommand(requester, bot, command))
+                ++executed;
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, "RTI_ACK", payload.str());
+}
+
 ChatMsg NormalizeReplyChatType(uint32 type)
 {
     switch (type)
@@ -1950,6 +2037,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const commandRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             RunOutfitCommand(player, replyType, botRequest.first, tokenRequest.first, commandRequest.first, commandRequest.second);
+            return true;
+        }
+
+        if (requestType == "RTI")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunRTICommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
