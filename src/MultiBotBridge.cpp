@@ -1614,6 +1614,14 @@ bool IsAllowedCombatCommand(std::string const& command)
         "CO -DPS AOE",
         "CO +TANK ASSIST",
         "CO -TANK ASSIST",
+        "CO +AVOID AOE",
+        "CO -AVOID AOE",
+        "CO +SAVE MANA",
+        "CO -SAVE MANA",
+        "CO +THREAT",
+        "CO -THREAT",
+        "CO +BEHIND",
+        "CO -BEHIND",
         "CO +WAIT FOR ATTACK",
         "CO -WAIT FOR ATTACK"
     };
@@ -2138,16 +2146,6 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         {
             std::pair<std::string, std::string> const outfitRequest = SplitOnce(request.second, kFieldSeparator);
             SendOutfitPackets(player, replyType, outfitRequest.first, Trim(outfitRequest.second));
-            return true;
-        }
-
-        if (requestType == "COMBAT")
-        {
-            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
-            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
-            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
-
-            RunCombatCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
