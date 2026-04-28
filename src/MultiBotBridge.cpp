@@ -1686,6 +1686,29 @@ bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope
     return false;
 }
 
+bool BotMatchesCombatScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
+{
+    if (!requester || !bot)
+        return false;
+
+    if (scope == "ALL" || scope == "RAID")
+        return true;
+
+    if (scope == "GROUP" || scope == "PARTY")
+    {
+        if (!target.empty())
+            return BotMatchesRTIScope(requester, bot, "GROUP", target);
+
+        Group* const group = requester->GetGroup();
+        if (!group)
+            return false;
+
+        return bot->GetGroup() == group;
+    }
+
+    return BotMatchesRTIScope(requester, bot, scope, target);
+}
+
 void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
@@ -1724,16 +1747,17 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
     std::string const scope = ToUpper(Trim(scopeValue));
     std::string const target = Trim(UrlDecodeField(encodedTarget));
     std::string const token = Trim(requestToken);
-    std::string const command = Trim(UrlDecodeField(encodedCommand));
+    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const command = NormalizeCombatCommand(rawCommand);
     uint32 executed = 0;
 
     PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
-    if (mgr && IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "GROUP" || scope == "BOT"))
+    if (mgr && IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
         for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
         {
             Player* const bot = it->second;
-            if (!BotMatchesRTIScope(requester, bot, scope, target))
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
             if (ExecuteSilentBotCommand(requester, bot, command))
@@ -2141,6 +2165,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const commandRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             RunOutfitCommand(player, replyType, botRequest.first, tokenRequest.first, commandRequest.first, commandRequest.second);
+            return true;
+        }
+
+        if (requestType == "COMBAT")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunCombatCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
