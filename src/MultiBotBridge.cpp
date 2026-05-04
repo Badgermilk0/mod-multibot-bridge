@@ -1,10 +1,12 @@
 #include "Chat.h"
 #include "Config.h"
+#include "Creature.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "ChatHelper.h"
 #include "GameObject.h"
 #include "Group.h"
+#include "GuildMgr.h"
 #include "Item.h"
 #include "ItemPackets.h"
 #include "ObjectMgr.h"
@@ -17,6 +19,7 @@
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "Spell.h"
 #include "SpellMgr.h"
 #include "Unit.h"
 #include "World.h"
@@ -25,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -46,10 +50,13 @@ bool BridgeConsoleLogsEnabled()
 }
 
 Player* FindBotByName(Player* player, std::string const& botName);
+PlayerbotAI* GetBotAI(Player* bot);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
+void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
+void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
 uint32 GetPct(uint32 current, uint32 max);
 
 std::string Trim(std::string const& value)
@@ -521,16 +528,28 @@ SkillLineAbilityEntry const* GetSkillLineAbilityForSpell(uint32 spellId)
     return it != spellSkillLines.end() ? it->second : nullptr;
 }
 
-bool IsProfessionSkillLine(uint32 skillId)
+bool IsSecondarySkillLine(uint32 skillId)
 {
-    SkillLineEntry const* const skillLine = sSkillLineStore.LookupEntry(skillId);
-    return skillLine && skillLine->categoryId == SKILL_CATEGORY_PROFESSION;
+    for (SkillDefinition const& definition : kSecondarySkillDefinitions)
+        if (definition.skillId == skillId)
+            return true;
+
+    return false;
 }
 
-bool IsProfessionSpell(uint32 spellId)
+bool IsSpellbookExcludedSkillLine(uint32 skillId)
+{
+    SkillLineEntry const* const skillLine = sSkillLineStore.LookupEntry(skillId);
+    if (skillLine && skillLine->categoryId == SKILL_CATEGORY_PROFESSION)
+        return true;
+
+    return IsSecondarySkillLine(skillId);
+}
+
+bool IsSpellbookExcludedSpell(uint32 spellId)
 {
     SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(spellId);
-    return skillLine && IsProfessionSkillLine(skillLine->SkillLine);
+    return skillLine && IsSpellbookExcludedSkillLine(skillLine->SkillLine);
 }
 
 void AddSkillEntry(Player* bot, SkillDefinition const& definition, std::vector<BotSkillEntryData>& entries, std::set<uint32>& seen)
@@ -1182,7 +1201,7 @@ std::vector<SpellbookEntryData> BuildSpellbookEntries(Player* bot)
         if (!spellInfo || spellInfo->IsPassive() || !spellInfo->SpellName[0])
             continue;
 
-        if (IsProfessionSpell(it->first))
+        if (IsSpellbookExcludedSpell(it->first))
             continue;
 
         std::string const spellName = spellInfo->SpellName[0];
@@ -1288,6 +1307,206 @@ std::string BuildRecipeMaterialsPayload(SpellInfo const* spellInfo, std::map<uin
     return materials.str();
 }
 
+bool BotHasRecipeRequiredTools(Player* bot, SpellInfo const* spellInfo)
+{
+    if (!bot || !spellInfo)
+        return false;
+
+    for (uint32 index = 0; index < 2; ++index)
+    {
+        if (spellInfo->Totem[index] && !bot->HasItemCount(spellInfo->Totem[index]))
+            return false;
+
+        if (spellInfo->TotemCategory[index] && !bot->HasItemTotemCategory(spellInfo->TotemCategory[index]))
+            return false;
+    }
+
+    return true;
+}
+
+uint32 GetRecipeCreatedItemId(SpellInfo const* spellInfo)
+{
+    if (!spellInfo)
+        return 0;
+
+    for (uint32 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+        if (spellInfo->Effects[effectIndex].Effect == SPELL_EFFECT_CREATE_ITEM && spellInfo->Effects[effectIndex].ItemType > 0)
+            return spellInfo->Effects[effectIndex].ItemType;
+
+    return 0;
+}
+
+bool IsKnownActiveBotSpell(Player* bot, uint32 spellId)
+{
+    if (!bot || !spellId)
+        return false;
+
+    PlayerSpellMap::const_iterator const it = bot->GetSpellMap().find(spellId);
+    if (it == bot->GetSpellMap().end() || !it->second)
+        return false;
+
+    if (it->second->State == PLAYERSPELL_REMOVED || !it->second->Active)
+        return false;
+
+    return (it->second->specMask & bot->GetActiveSpecMask()) != 0;
+}
+
+std::string GetSpellCastFailureReason(SpellCastResult result)
+{
+    switch (result)
+    {
+        case SPELL_CAST_OK:
+            return "OK";
+        case SPELL_FAILED_REQUIRES_SPELL_FOCUS:
+            return "REQUIRES_SPELL_FOCUS";
+        case SPELL_FAILED_REQUIRES_AREA:
+            return "REQUIRES_AREA";
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_MAINHAND:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_OFFHAND:
+        case SPELL_FAILED_TOTEM_CATEGORY:
+        case SPELL_FAILED_TOTEMS:
+            return "MISSING_TOOLS";
+        case SPELL_FAILED_REAGENTS:
+        case SPELL_FAILED_NEED_MORE_ITEMS:
+            return "NO_MATERIALS";
+        case SPELL_FAILED_MOVING:
+            return "MOVING";
+        case SPELL_FAILED_NOT_STANDING:
+            return "NOT_STANDING";
+        case SPELL_FAILED_NOT_READY:
+        case SPELL_FAILED_SPELL_IN_PROGRESS:
+            return "NOT_READY";
+        case SPELL_FAILED_OUT_OF_RANGE:
+            return "OUT_OF_RANGE";
+        case SPELL_FAILED_TRY_AGAIN:
+            return "TRY_AGAIN";
+        default:
+            std::ostringstream reason;
+            reason << "CAST_FAILED_" << static_cast<uint32>(result);
+            return reason.str();
+    }
+}
+
+std::string ValidateProfessionRecipeCraft(Player* bot, uint32 skillId, uint32 spellId, uint32 expectedItemId, uint32& actualItemId)
+{
+    actualItemId = expectedItemId;
+
+    if (!bot)
+        return "NO_BOT";
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI)
+        return "NO_AI";
+
+    if (!skillId || !spellId)
+        return "BAD_REQUEST";
+
+    if (!IsKnownActiveBotSpell(bot, spellId))
+        return "UNKNOWN_RECIPE";
+
+    SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(spellId);
+    if (!skillLine || skillLine->SkillLine != skillId)
+        return "SKILL_MISMATCH";
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || spellInfo->IsPassive())
+        return "BAD_RECIPE";
+
+    actualItemId = GetRecipeCreatedItemId(spellInfo);
+    if (expectedItemId && actualItemId && expectedItemId != actualItemId)
+        return "ITEM_MISMATCH";
+
+    if (!BotHasRecipeRequiredTools(bot, spellInfo))
+        return "MISSING_TOOLS";
+
+    uint32 craftable = 0;
+    BuildRecipeMaterialsPayload(spellInfo, BuildBotInventoryItemCounts(bot), craftable);
+    if (!craftable)
+        return "NO_MATERIALS";
+
+    return "OK";
+}
+
+void BuildProfessionRecipeCastTargets(Player* bot, PlayerbotAI* botAI, SpellInfo const* spellInfo, SpellCastTargets& targets)
+{
+    if (!bot || !spellInfo)
+        return;
+
+    if (spellInfo->Effects[0].Effect != SPELL_EFFECT_OPEN_LOCK &&
+        (spellInfo->Targets & TARGET_FLAG_ITEM || spellInfo->Targets & TARGET_FLAG_GAMEOBJECT_ITEM))
+    {
+        Item* item = nullptr;
+        if (botAI && botAI->GetAiObjectContext())
+            item = botAI->GetAiObjectContext()->GetValue<Item*>("item for spell", spellInfo->Id)->Get();
+
+        targets.SetItemTarget(item);
+    }
+    else if (spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)
+        targets.SetDst(*bot);
+    else if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
+        targets.SetDst(*bot);
+    else
+        targets.SetUnitTarget(bot);
+}
+
+std::string CheckProfessionRecipeCast(Player* bot, PlayerbotAI* botAI, SpellInfo const* spellInfo)
+{
+    if (!bot || !spellInfo)
+        return "BAD_RECIPE";
+
+    Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    BuildProfessionRecipeCastTargets(bot, botAI, spellInfo, targets);
+
+    SpellCastResult const result = spell->CheckCast(true);
+    delete spell;
+
+    return GetSpellCastFailureReason(result);
+}
+
+std::string CastProfessionRecipe(Player* bot, uint32 spellId)
+{
+    if (!bot || !spellId)
+        return "BAD_REQUEST";
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+        return "NO_AI";
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo)
+        return "BAD_RECIPE";
+
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+        return "LOST_CONTROL";
+
+    if (bot->IsFlying() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+        return "IN_FLIGHT";
+
+    if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+        return "CHANNELING";
+
+    if (bot->HasSpellCooldown(spellId))
+        return "NOT_READY";
+
+    if (!bot->IsStandState())
+    {
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+        return "NOT_STANDING";
+    }
+
+    uint32 const castTime = !spellInfo->IsChanneled() ? spellInfo->CalcCastTime(bot) : spellInfo->GetDuration();
+    if ((castTime || spellInfo->IsAutoRepeatRangedSpell()) && bot->isMoving())
+        return "MOVING";
+
+    std::string const checkResult = CheckProfessionRecipeCast(bot, botAI, spellInfo);
+    if (checkResult != "OK")
+        return checkResult;
+
+    return botAI->CastSpell(spellId, bot) ? "OK" : "TRY_AGAIN";
+}
+
 std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot, uint32 skillId)
 {
     std::vector<ProfessionRecipeEntryData> entries;
@@ -1325,10 +1544,10 @@ std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot,
         entry.spellName = spellName;
         entry.difficulty = GetRecipeDifficulty(bot, skillLine);
         entry.materials = BuildRecipeMaterialsPayload(spellInfo, itemCounts, entry.craftable);
+        if (entry.craftable && !BotHasRecipeRequiredTools(bot, spellInfo))
+            entry.craftable = 0;
 
-        for (uint32 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
-            if (spellInfo->Effects[effectIndex].Effect == SPELL_EFFECT_CREATE_ITEM && spellInfo->Effects[effectIndex].ItemType > 0)
-                entry.itemId = spellInfo->Effects[effectIndex].ItemType;
+        entry.itemId = GetRecipeCreatedItemId(spellInfo);
 
         entries.push_back(entry);
     }
@@ -1534,6 +1753,298 @@ void SendInventorySnapshot(Player* requester, ChatMsg replyType, std::string con
     }
 
     SendAddonPacket(requester, replyType, "INV_END", bot->GetName() + std::string(1, kFieldSeparator) + requestToken);
+}
+
+PlayerbotAI* GetBotAI(Player* bot)
+{
+    if (!bot)
+        return nullptr;
+
+    return sPlayerbotsMgr.GetPlayerbotAI(bot);
+}
+
+Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag)
+{
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetAiObjectContext())
+        return nullptr;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
+    for (ObjectGuid const guid : npcs)
+    {
+        Unit* const unit = botAI->GetUnit(guid);
+        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(npcFlag)))
+            continue;
+
+        if (Creature* const creature = unit->ToCreature())
+            return creature;
+    }
+
+    return nullptr;
+}
+
+Creature* FindNearbyVendorSellingItem(Player* bot, uint32 itemId, uint32& vendorSlot, uint32& vendorExtendedCost, bool& sawVendor)
+{
+    vendorSlot = 0;
+    vendorExtendedCost = 0;
+    sawVendor = false;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetAiObjectContext() || !itemId)
+        return nullptr;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
+    for (ObjectGuid const guid : npcs)
+    {
+        Unit* const unit = botAI->GetUnit(guid);
+        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(UNIT_NPC_FLAG_VENDOR)))
+            continue;
+
+        Creature* const creature = unit->ToCreature();
+        if (!creature)
+            continue;
+
+        sawVendor = true;
+        VendorItemData const* const vendorItems = creature->GetVendorItems();
+        if (!vendorItems)
+            continue;
+
+        for (uint32 slot = 0; slot < vendorItems->GetItemCount(); ++slot)
+        {
+            VendorItem const* const vendorItem = vendorItems->GetItem(slot);
+            if (vendorItem && vendorItem->item == itemId)
+            {
+                vendorSlot = slot;
+                vendorExtendedCost = vendorItem->ExtendedCost;
+                return creature;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+GameObject* FindNearbyGuildBank(Player* bot)
+{
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetAiObjectContext())
+        return nullptr;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    GuidVector const objects = *context->GetValue<GuidVector>("nearest game objects");
+    for (ObjectGuid const guid : objects)
+        if (GameObject* const go = botAI->GetGameObject(guid))
+            if (bot->GetGameObjectIfCanInteractWith(go->GetGUID(), GAMEOBJECT_TYPE_GUILD_BANK))
+                return go;
+
+    return nullptr;
+}
+
+Item* FindBagItemByEntry(Player* bot, uint32 itemEntry)
+{
+    if (!bot || !itemEntry)
+        return nullptr;
+
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            if (item->GetEntry() == itemEntry)
+                return item;
+
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        Bag const* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
+        if (!pBag)
+            continue;
+
+        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+            if (Item* const item = bot->GetItemByPos(bag, slot))
+                if (item->GetEntry() == itemEntry)
+                    return item;
+    }
+
+    return nullptr;
+}
+
+Item* FindBankItemByEntry(Player* bot, uint32 itemEntry)
+{
+    if (!bot || !itemEntry)
+        return nullptr;
+
+    for (uint8 slot = BANK_SLOT_ITEM_START; slot < BANK_SLOT_ITEM_END; ++slot)
+        if (Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            if (item->GetEntry() == itemEntry)
+                return item;
+
+    for (uint8 bag = BANK_SLOT_BAG_START; bag < BANK_SLOT_BAG_END; ++bag)
+    {
+        Bag const* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
+        if (!pBag)
+            continue;
+
+        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+            if (Item* const item = bot->GetItemByPos(bag, slot))
+                if (item->GetEntry() == itemEntry)
+                    return item;
+    }
+
+    return nullptr;
+}
+
+void AddBankItemToSnapshot(std::map<uint32, uint32>& itemCounts, std::map<uint32, ItemTemplate const*>& itemTemplates, std::map<uint32, bool>& soulboundByEntry, Item* item)
+{
+    if (!item)
+        return;
+
+    ItemTemplate const* const proto = item->GetTemplate();
+    if (!proto)
+        return;
+
+    uint32 const itemId = proto->ItemId;
+    itemCounts[itemId] += item->GetCount();
+    itemTemplates[itemId] = proto;
+    if (item->IsSoulBound())
+        soulboundByEntry[itemId] = true;
+}
+
+void AddItemEntryToSnapshot(std::map<uint32, uint32>& itemCounts, std::map<uint32, ItemTemplate const*>& itemTemplates, uint32 itemId, uint32 count)
+{
+    if (!itemId || !count)
+        return;
+
+    ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(itemId);
+    if (!proto)
+        return;
+
+    itemCounts[itemId] += count;
+    itemTemplates[itemId] = proto;
+}
+
+void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
+
+    SendAddonPacket(requester, replyType, "BANK_BEGIN", prefixPayload);
+
+    if (!bot)
+    {
+        SendAddonPacket(requester, replyType, "BANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + "NO_BOT");
+        SendAddonPacket(requester, replyType, "BANK_END", prefixPayload);
+        return;
+    }
+
+    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
+    {
+        SendAddonPacket(requester, replyType, "BANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + "BANKER_NOT_FOUND");
+        SendAddonPacket(requester, replyType, "BANK_END", prefixPayload);
+        return;
+    }
+
+    std::map<uint32, uint32> itemCounts;
+    std::map<uint32, ItemTemplate const*> itemTemplates;
+    std::map<uint32, bool> soulboundByEntry;
+
+    for (uint8 slot = BANK_SLOT_ITEM_START; slot < BANK_SLOT_ITEM_END; ++slot)
+        AddBankItemToSnapshot(itemCounts, itemTemplates, soulboundByEntry, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+
+    for (uint8 bag = BANK_SLOT_BAG_START; bag < BANK_SLOT_BAG_END; ++bag)
+    {
+        Bag const* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
+        if (!pBag)
+            continue;
+
+        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
+            AddBankItemToSnapshot(itemCounts, itemTemplates, soulboundByEntry, bot->GetItemByPos(bag, slot));
+    }
+
+    for (auto const& entry : itemCounts)
+    {
+        ItemTemplate const* const proto = itemTemplates[entry.first];
+        if (!proto)
+            continue;
+
+        std::string line = ChatHelper::FormatItem(proto, entry.second);
+        if (soulboundByEntry[entry.first])
+            line += " (soulbound)";
+
+        SendAddonPacket(requester, replyType, "BANK_ITEM", prefixPayload + std::string(1, kFieldSeparator) + UrlEncodeField(line));
+    }
+
+    SendAddonPacket(requester, replyType, "BANK_END", prefixPayload);
+}
+
+void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
+
+    SendAddonPacket(requester, replyType, "GBANK_BEGIN", prefixPayload);
+
+    auto sendErrorAndEnd = [&](std::string const& reason)
+    {
+        SendAddonPacket(requester, replyType, "GBANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + reason);
+        SendAddonPacket(requester, replyType, "GBANK_END", prefixPayload);
+    };
+
+    if (!bot)
+    {
+        sendErrorAndEnd("NO_BOT");
+        return;
+    }
+
+    if (!bot->GetGuildId())
+    {
+        sendErrorAndEnd("BOT_NOT_IN_GUILD");
+        return;
+    }
+
+    Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
+    if (!guild)
+    {
+        sendErrorAndEnd("BOT_NOT_IN_GUILD");
+        return;
+    }
+
+    std::map<uint32, uint32> itemCounts;
+    std::map<uint32, ItemTemplate const*> itemTemplates;
+
+    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT ii.itemEntry, ii.count "
+            "FROM guild_bank_item gbi "
+            "INNER JOIN item_instance ii ON ii.guid = gbi.item_guid "
+            "WHERE gbi.guildid = {} AND gbi.TabId = {} "
+            "ORDER BY gbi.SlotId",
+            guild->GetId(), uint32(tabId));
+
+        if (!result)
+            continue;
+
+        do
+        {
+            Field* const fields = result->Fetch();
+            AddItemEntryToSnapshot(itemCounts, itemTemplates, fields[0].Get<uint32>(), fields[1].Get<uint32>());
+        }
+        while (result->NextRow());
+    }
+
+    for (auto const& entry : itemCounts)
+    {
+        ItemTemplate const* const proto = itemTemplates[entry.first];
+        if (!proto)
+            continue;
+
+        SendAddonPacket(requester, replyType, "GBANK_ITEM", prefixPayload + std::string(1, kFieldSeparator) + UrlEncodeField(ChatHelper::FormatItem(proto, entry.second)));
+    }
+
+    SendAddonPacket(requester, replyType, "GBANK_END", prefixPayload);
 }
 
 void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
@@ -2042,6 +2553,272 @@ bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& 
 
     botAI->HandleCommand(CHAT_MSG_WHISPER, command, requester);
     return true;
+}
+
+uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
+{
+    if (!bot || !itemId)
+    {
+        reason = "BAD_REQUEST";
+        return 0;
+    }
+
+    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
+    {
+        reason = "BANKER_NOT_FOUND";
+        return 0;
+    }
+
+    uint32 moved = 0;
+    while (Item* const item = FindBagItemByEntry(bot, itemId))
+    {
+        uint32 const stackCount = item->GetCount();
+        ItemPosCountVec dest;
+        InventoryResult const msg = bot->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false);
+        if (msg != EQUIP_ERR_OK)
+        {
+            reason = "BANK_FULL";
+            return moved;
+        }
+
+        bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+        bot->BankItem(dest, item, true);
+        moved += stackCount;
+
+        if (requestedCount > 0 && moved >= requestedCount)
+            break;
+    }
+
+    if (!moved)
+        reason = "ITEM_NOT_FOUND";
+
+    return moved;
+}
+
+uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
+{
+    if (!bot || !itemId)
+    {
+        reason = "BAD_REQUEST";
+        return 0;
+    }
+
+    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
+    {
+        reason = "BANKER_NOT_FOUND";
+        return 0;
+    }
+
+    uint32 moved = 0;
+    while (Item* const item = FindBankItemByEntry(bot, itemId))
+    {
+        uint32 const stackCount = item->GetCount();
+        ItemPosCountVec dest;
+        InventoryResult const msg = bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+        if (msg != EQUIP_ERR_OK)
+        {
+            reason = "BAGS_FULL";
+            return moved;
+        }
+
+        bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+        bot->StoreItem(dest, item, true);
+        moved += stackCount;
+
+        if (requestedCount > 0 && moved >= requestedCount)
+            break;
+    }
+
+    if (!moved)
+        reason = "ITEM_NOT_FOUND";
+
+    return moved;
+}
+
+uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
+{
+    if (!bot || !itemId)
+    {
+        reason = "BAD_REQUEST";
+        return 0;
+    }
+
+    if (!bot->GetGuildId())
+    {
+        reason = "BOT_NOT_IN_GUILD";
+        return 0;
+    }
+
+    Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
+    if (!guild)
+    {
+        reason = "BOT_NOT_IN_GUILD";
+        return 0;
+    }
+
+    if (!FindNearbyGuildBank(bot))
+    {
+        reason = "GUILD_BANK_NOT_FOUND";
+        return 0;
+    }
+
+    if (!guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+    {
+        reason = "NO_GUILD_BANK_RIGHTS";
+        return 0;
+    }
+
+    uint32 moved = 0;
+    while (Item* const item = FindBagItemByEntry(bot, itemId))
+    {
+        uint32 const stackCount = item->GetCount();
+        uint32 const playerSlot = item->GetSlot();
+        uint32 const playerBag = item->GetBagSlot();
+        ObjectGuid const itemGuid = item->GetGUID();
+        guild->SwapItemsWithInventory(bot, false, 0, 255, playerBag, playerSlot, 0);
+
+        if (Item* const remaining = bot->GetItemByPos(playerBag, playerSlot))
+            if (remaining->GetGUID() == itemGuid)
+            {
+                reason = "GUILD_BANK_FULL";
+                return moved;
+            }
+
+        moved += stackCount;
+
+        if (requestedCount > 0 && moved >= requestedCount)
+            break;
+    }
+
+    if (!moved)
+        reason = "ITEM_NOT_FOUND";
+
+    return moved;
+}
+
+uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
+{
+    if (!bot || !itemId)
+    {
+        reason = "BAD_REQUEST";
+        return 0;
+    }
+
+    ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(itemId);
+    if (!proto)
+    {
+        reason = "ITEM_NOT_FOUND";
+        return 0;
+    }
+
+    uint32 vendorSlot = 0;
+    uint32 vendorExtendedCost = 0;
+    bool sawVendor = false;
+    Creature* const vendor = FindNearbyVendorSellingItem(bot, itemId, vendorSlot, vendorExtendedCost, sawVendor);
+    if (!vendor)
+    {
+        reason = sawVendor ? "VENDOR_DOES_NOT_SELL_ITEM" : "VENDOR_NOT_FOUND";
+        return 0;
+    }
+
+    uint32 const desired = requestedCount > 0 ? requestedCount : 1;
+    uint32 bought = 0;
+    for (uint32 i = 0; i < desired; ++i)
+    {
+        uint32 const price = uint32(std::floor(proto->BuyPrice * bot->GetReputationPriceDiscount(vendor)));
+        if (price > 0 && bot->GetMoney() < price)
+        {
+            reason = "NOT_ENOUGH_MONEY";
+            break;
+        }
+
+        uint32 const oldCount = bot->GetItemCount(itemId, false);
+        bot->BuyItemFromVendorSlot(vendor->GetGUID(), vendorSlot, itemId, 1, NULL_BAG, NULL_SLOT);
+        uint32 const newCount = bot->GetItemCount(itemId, false);
+        if (newCount <= oldCount)
+        {
+            reason = vendorExtendedCost > 0 ? "VENDOR_REQUIRES_SPECIAL_CURRENCY" : "BUY_FAILED";
+            break;
+        }
+
+        bought += newCount - oldCount;
+    }
+
+    return bought;
+}
+
+void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    std::string const action = ToUpper(Trim(actionValue));
+    uint32 const itemId = static_cast<uint32>(std::strtoul(Trim(itemIdValue).c_str(), nullptr, 10));
+    uint32 const requestedCount = static_cast<uint32>(std::strtoul(Trim(countValue).c_str(), nullptr, 10));
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string reason;
+    uint32 moved = 0;
+    if (!bot)
+        reason = "NO_BOT";
+    else if (action == "BANK_DEPOSIT")
+        moved = MoveMatchingBagItemsToBank(bot, itemId, requestedCount, reason);
+    else if (action == "BANK_WITHDRAW")
+        moved = MoveMatchingBankItemsToBags(bot, itemId, requestedCount, reason);
+    else if (action == "GBANK_DEPOSIT")
+        moved = MoveMatchingBagItemsToGuildBank(requester, bot, itemId, requestedCount, reason);
+    else if (action == "GBANK_WITHDRAW")
+        reason = "NOT_SUPPORTED";
+    else if (action == "BUY_ITEM")
+        moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
+    else
+        reason = "BAD_ACTION";
+
+    bool const ok = moved > 0;
+    if (ok)
+        reason = "OK";
+    else if (reason.empty())
+        reason = "FAILED";
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << action
+        << kFieldSeparator << itemId
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << moved;
+
+    SendAddonPacket(requester, replyType, "INVENTORY_ITEM_ACTION", payload.str());
+}
+
+void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    uint32 const skillId = static_cast<uint32>(std::strtoul(Trim(skillIdValue).c_str(), nullptr, 10));
+    uint32 const spellId = static_cast<uint32>(std::strtoul(Trim(spellIdValue).c_str(), nullptr, 10));
+    uint32 const expectedItemId = static_cast<uint32>(std::strtoul(Trim(itemIdValue).c_str(), nullptr, 10));
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    uint32 actualItemId = expectedItemId;
+    std::string result = ValidateProfessionRecipeCraft(bot, skillId, spellId, expectedItemId, actualItemId);
+    if (result == "OK")
+        result = CastProfessionRecipe(bot, spellId);
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << skillId
+        << kFieldSeparator << spellId
+        << kFieldSeparator << actualItemId
+        << kFieldSeparator << (result == "OK" ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(result);
+
+    SendAddonPacket(requester, replyType, "PROFESSION_RECIPE_CRAFT", payload.str());
 }
 
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken)
@@ -2855,6 +3632,20 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "BANK")
+        {
+            std::pair<std::string, std::string> const bankRequest = SplitOnce(request.second, kFieldSeparator);
+            SendBankPackets(player, replyType, bankRequest.first, Trim(bankRequest.second));
+            return true;
+        }
+
+        if (requestType == "GBANK")
+        {
+            std::pair<std::string, std::string> const bankRequest = SplitOnce(request.second, kFieldSeparator);
+            SendGuildBankPackets(player, replyType, bankRequest.first, Trim(bankRequest.second));
+            return true;
+        }
+
         if (requestType == "SPELLBOOK")
         {
             std::pair<std::string, std::string> const spellbookRequest = SplitOnce(request.second, kFieldSeparator);
@@ -2898,6 +3689,26 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const commandRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             RunOutfitCommand(player, replyType, botRequest.first, tokenRequest.first, commandRequest.first, commandRequest.second);
+            return true;
+        }
+
+        if (requestType == "CRAFT_RECIPE")
+        {
+            std::pair<std::string, std::string> const botRequest = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const skillRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const spellRequest = SplitOnce(skillRequest.second, kFieldSeparator);
+            RunProfessionRecipeCraftCommand(player, replyType, botRequest.first, tokenRequest.first, skillRequest.first, spellRequest.first, spellRequest.second);
+            return true;
+        }
+
+        if (requestType == "ITEM_ACTION")
+        {
+            std::pair<std::string, std::string> const botRequest = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const actionRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const itemRequest = SplitOnce(actionRequest.second, kFieldSeparator);
+            RunInventoryItemActionCommand(player, replyType, botRequest.first, tokenRequest.first, actionRequest.first, itemRequest.first, itemRequest.second);
             return true;
         }
 
