@@ -297,7 +297,20 @@ git pull
 
 # Protocol Overview
 
-The bridge uses the `MBOT` addon-message prefix.
+The bridge uses the `MBOT` addon-message prefix. The current **protocol version is `2`**
+(`kProtocolVersion` in `MultiBotBridge.cpp`, `Comm.version` in the addon's `MultiBotComm.lua`).
+
+**Framing.** A packet is `MBOT\t<OPCODE>~<payload>`. Fields inside a payload are separated
+by `~`. Any field that could contain a delimiter or a newline is percent-encoded (`%` `~`
+`\r` `\n` → `%XX`); the addon reverses this. Names are URL-encoded so they can never collide
+with a separator.
+
+**Streaming.** Any list that could exceed the addon-message length limit is sent as a
+`<NAME>_BEGIN` / `<NAME>_ITEM` (one per element) / `<NAME>_END` sequence rather than a single
+message — this applies to inventory, bank, guild bank, spellbook, quests, glyphs, outfits,
+trainer, professions recipes, reputations, emblems, and (as of v2) the **roster**. Per-bot
+streams that aren't `BEGIN/END`-framed (`DETAIL`, `STATE`) are always followed by a single
+empty `DETAILS` / `STATES` terminator so the client can tell when the batch is complete.
 
 Common request / response flow:
 
@@ -309,13 +322,23 @@ Addon  -> Server: MBOT PING~<token>
 Server -> Addon:  MBOT PONG~<token>
 
 Addon  -> Server: MBOT GET~ROSTER
-Server -> Addon:  MBOT ROSTER~...
+Server -> Addon:  MBOT ROSTER_BEGIN~
+                  MBOT ROSTER_ITEM~<name>,<class>,<level>,<map>,<alive>,<hp%>,<mp%>   (one per bot)
+                  MBOT ROSTER_END~
 
 Addon  -> Server: MBOT GET~STATES
-Server -> Addon:  MBOT STATES~...
+Server -> Addon:  MBOT STATE~<name>~<combatStrategies>~<nonCombatStrategies>          (one per bot)
+                  MBOT STATES~                                                        (terminator)
 ```
 
 The exact payloads are consumed internally by the MultiBot addon.
+
+> **Version history**
+> - **v2** — `ROSTER` is streamed as `ROSTER_BEGIN`/`ROSTER_ITEM`/`ROSTER_END` (was a single
+>   `ROSTER~a;b;c` message that could be truncated for large raids); roster names are now
+>   URL-encoded; `DETAIL` and `STATE` streams always emit their `DETAILS`/`STATES` terminator.
+>   A v2 addon still accepts a v1 single-message `ROSTER` from an older bridge.
+> - **v1** — initial bridge protocol.
 
 ---
 

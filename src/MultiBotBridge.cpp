@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -45,12 +46,14 @@ namespace
 {
 char const* const kAddonPrefix = "MBOT";
 char const* const kBridgeName = "mod-multibot-bridge";
-char const* const kProtocolVersion = "1";
+char const* const kProtocolVersion = "2"; // v2: ROSTER streamed (ROSTER_BEGIN/ITEM/END), DETAILS/STATES always terminated.
 char const kFieldSeparator = '~';
 
 bool BridgeConsoleLogsEnabled()
 {
-    return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", true);
+    // Default off to match conf/MultiBotBridge.conf.dist (= 0). A true default made a
+    // server that never copied the .conf log every RX/TX addon message.
+    return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", false);
 }
 
 Player* FindBotByName(Player* player, std::string const& botName);
@@ -1554,12 +1557,11 @@ std::string CheckProfessionRecipeCast(Player* bot, PlayerbotAI* botAI, SpellInfo
     if (!bot || !spellInfo)
         return "BAD_RECIPE";
 
-    Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
+    std::unique_ptr<Spell> const spell(new Spell(bot, spellInfo, TRIGGERED_NONE));
     SpellCastTargets targets;
     BuildProfessionRecipeCastTargets(bot, botAI, spellInfo, targets);
 
     SpellCastResult const result = spell->CheckCast(true);
-    delete spell;
 
     return GetSpellCastFailureReason(result);
 }
@@ -3368,6 +3370,8 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
     uint32 moved = 0;
     if (!bot)
         reason = "NO_BOT";
+    else if (!itemId)
+        reason = "BAD_REQUEST"; // itemIdValue was empty or non-numeric (strtoul -> 0); never dispatch a move/buy on item 0.
     else if (action == "BANK_DEPOSIT")
         moved = MoveMatchingBagItemsToBank(bot, itemId, requestedCount, reason);
     else if (action == "BANK_WITHDRAW")
@@ -3956,29 +3960,30 @@ std::string JoinStrategies(std::vector<std::string> const& strategies)
     return out.str();
 }
 
-std::string BuildRosterPayload(Player* player)
+std::string FormatRosterEntry(Player* bot)
 {
     std::ostringstream out;
-    bool first = true;
-
-    for (Player* const bot : GetBridgeVisibleBots(player))
-    {
-        if (!first)
-            out << ';';
-        first = false;
-
-        out << bot->GetName() << ',' << static_cast<uint32>(bot->getClass()) << ',' << static_cast<uint32>(bot->GetLevel())
-            << ',' << static_cast<uint32>(bot->GetMapId()) << ',' << (bot->IsAlive() ? '1' : '0') << ','
-            << GetPct(bot->GetHealth(), bot->GetMaxHealth()) << ',' << GetPct(bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA));
-    }
-
+    // B5: URL-encode the name so it can never contain the ',' field separator (or any
+    // other delimiter), keeping per-entry parsing unambiguous on custom-name servers.
+    out << UrlEncodeField(bot->GetName()) << ',' << static_cast<uint32>(bot->getClass()) << ',' << static_cast<uint32>(bot->GetLevel())
+        << ',' << static_cast<uint32>(bot->GetMapId()) << ',' << (bot->IsAlive() ? '1' : '0') << ','
+        << GetPct(bot->GetHealth(), bot->GetMaxHealth()) << ',' << GetPct(bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA));
     return out.str();
+}
+
+// C1: the roster is streamed as ROSTER_BEGIN / one ROSTER_ITEM per bot / ROSTER_END so a
+// large raid roster can never exceed the addon-message length. Every other large list
+// already chunks the same way; ROSTER was the lone single-message exception.
+void SendRosterPackets(Player* player, ChatMsg replyType)
+{
+    SendAddonPacket(player, replyType, "ROSTER_BEGIN", "");
+    for (Player* const bot : GetBridgeVisibleBots(player))
+        SendAddonPacket(player, replyType, "ROSTER_ITEM", FormatRosterEntry(bot));
+    SendAddonPacket(player, replyType, "ROSTER_END", "");
 }
 
 void SendDetailPackets(Player* player, ChatMsg replyType)
 {
-    bool sent = false;
-
     for (Player* const bot : GetBridgeVisibleBots(player))
     {
         std::string const payload = BuildBotDetailPayload(bot);
@@ -3990,12 +3995,11 @@ void SendDetailPackets(Player* player, ChatMsg replyType)
         std::string const professionPayload = BuildBotProfessionPayload(bot);
         if (!professionPayload.empty())
             SendAddonPacket(player, replyType, "PROFESSION", professionPayload);
-
-        sent = true;
     }
 
-    if (!sent)
-        SendAddonPacket(player, replyType, "DETAILS", "");
+    // C2: always terminate the stream so the client knows the detail batch is complete
+    // (and not just when there were zero bots). Empty payload = no extra detail to apply.
+    SendAddonPacket(player, replyType, "DETAILS", "");
 }
 
 std::string BuildDetailPayload(Player* player, std::string const& botName)
@@ -4070,7 +4074,6 @@ std::string BuildStatePayload(Player* player, std::string const& botName)
 
 void SendStatePackets(Player* player, ChatMsg replyType)
 {
-    bool sent = false;
     for (Player* const bot : GetBridgeVisibleBots(player))
     {
         PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
@@ -4086,11 +4089,11 @@ void SendStatePackets(Player* player, ChatMsg replyType)
         std::ostringstream out;
         out << bot->GetName() << kFieldSeparator << combatStrategies << kFieldSeparator << nonCombatStrategies;
         SendAddonPacket(player, replyType, "STATE", out.str());
-        sent = true;
     }
 
-    if (!sent)
-        SendAddonPacket(player, replyType, "STATES", "");
+    // C2: always terminate the stream so the client can tell when the per-bot STATE
+    // batch is complete, not only when there were zero bots.
+    SendAddonPacket(player, replyType, "STATES", "");
 }
 
 std::string BuildStatsPayload(Player* player, std::string const& botName)
@@ -4135,7 +4138,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         if (requestType == "ROSTER")
         {
-            SendAddonPacket(player, replyType, "ROSTER", BuildRosterPayload(player));
+            SendRosterPackets(player, replyType);
             return true;
         }
 
