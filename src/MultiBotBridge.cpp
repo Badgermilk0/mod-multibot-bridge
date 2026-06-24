@@ -1204,7 +1204,11 @@ void AppendGameObjectUnitLines(PlayerbotAI* botAI, std::vector<std::string>& lin
         return;
 
     AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const units = *context->GetValue<GuidVector>(valueName);
+    auto* const unitsValue = context->GetValue<GuidVector>(valueName);
+    if (!unitsValue)
+        return;
+
+    GuidVector const units = *unitsValue;
     for (ObjectGuid const guid : units)
         if (Unit* const unit = botAI->GetUnit(guid))
             lines.push_back(unit->GetNameForLocaleIdx(sWorld->GetDefaultDbcLocale()));
@@ -1217,7 +1221,11 @@ void AppendGameObjectLines(PlayerbotAI* botAI, std::vector<std::string>& lines, 
         return;
 
     AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const objects = *context->GetValue<GuidVector>(valueName);
+    auto* const objectsValue = context->GetValue<GuidVector>(valueName);
+    if (!objectsValue)
+        return;
+
+    GuidVector const objects = *objectsValue;
     for (ObjectGuid const guid : objects)
         if (GameObject* const go = botAI->GetGameObject(guid))
             lines.push_back(ChatHelper::FormatGameobject(go));
@@ -1871,7 +1879,11 @@ Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag)
         return nullptr;
 
     AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
+    auto* const npcsValue = context->GetValue<GuidVector>("nearest npcs");
+    if (!npcsValue)
+        return nullptr;
+
+    GuidVector const npcs = *npcsValue;
     for (ObjectGuid const guid : npcs)
     {
         Unit* const unit = botAI->GetUnit(guid);
@@ -1896,7 +1908,11 @@ Creature* FindNearbyVendorSellingItem(Player* bot, uint32 itemId, uint32& vendor
         return nullptr;
 
     AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
+    auto* const npcsValue = context->GetValue<GuidVector>("nearest npcs");
+    if (!npcsValue)
+        return nullptr;
+
+    GuidVector const npcs = *npcsValue;
     for (ObjectGuid const guid : npcs)
     {
         Unit* const unit = botAI->GetUnit(guid);
@@ -1934,7 +1950,11 @@ GameObject* FindNearbyGuildBank(Player* bot)
         return nullptr;
 
     AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const objects = *context->GetValue<GuidVector>("nearest game objects");
+    auto* const objectsValue = context->GetValue<GuidVector>("nearest game objects");
+    if (!objectsValue)
+        return nullptr;
+
+    GuidVector const objects = *objectsValue;
     for (ObjectGuid const guid : objects)
         if (GameObject* const go = botAI->GetGameObject(guid))
             if (bot->GetGameObjectIfCanInteractWith(go->GetGUID(), GAMEOBJECT_TYPE_GUILD_BANK))
@@ -3169,7 +3189,18 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
         return 0;
     }
 
-    if (!guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+    // C-4: deposit into any tab the bot may deposit to, not just tab 0. Non-existent tabs
+    // and tabs without rights return 0 from MemberHasTabRights, so iterating up to
+    // GUILD_BANK_MAX_TABS safely skips them.
+    bool hasDepositTab = false;
+    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+        if (guild->MemberHasTabRights(bot->GetGUID(), tabId, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+        {
+            hasDepositTab = true;
+            break;
+        }
+
+    if (!hasDepositTab)
     {
         reason = "NO_GUILD_BANK_RIGHTS";
         return 0;
@@ -3182,14 +3213,30 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
         uint32 const playerSlot = item->GetSlot();
         uint32 const playerBag = item->GetBagSlot();
         ObjectGuid const itemGuid = item->GetGUID();
-        guild->SwapItemsWithInventory(bot, false, 0, 255, playerBag, playerSlot, 0);
 
-        if (Item* const remaining = bot->GetItemByPos(playerBag, playerSlot))
-            if (remaining->GetGUID() == itemGuid)
+        // Try each depositable tab until the item leaves the bag slot (tab 0 may be full
+        // while a later tab still has room). Slot 255 = auto-pick a free slot in that tab.
+        bool deposited = false;
+        for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+        {
+            if (!guild->MemberHasTabRights(bot->GetGUID(), tabId, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
+                continue;
+
+            guild->SwapItemsWithInventory(bot, false, tabId, 255, playerBag, playerSlot, 0);
+
+            Item* const remaining = bot->GetItemByPos(playerBag, playerSlot);
+            if (!remaining || remaining->GetGUID() != itemGuid)
             {
-                reason = "GUILD_BANK_FULL";
-                return moved;
+                deposited = true;
+                break;
             }
+        }
+
+        if (!deposited)
+        {
+            reason = "GUILD_BANK_FULL";
+            return moved;
+        }
 
         moved += stackCount;
 
@@ -3236,6 +3283,11 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
         return 0;
     }
 
+    // C-2: guild-bank contents are read from the DB (same source as the GBANK display in
+    // SendGuildBankPackets) rather than the live Guild object, because Guild::GetBankTab /
+    // BankTab item access are private in core. The async CharacterDatabase write queue means a
+    // just-deposited item can briefly lag here; the SwapItemsWithInventory delta-check below
+    // tolerates a stale slot (it only counts a real increase of the requested item).
     QueryResult result = CharacterDatabase.Query(
         "SELECT gbi.TabId, gbi.SlotId, ii.count "
         "FROM guild_bank_item gbi "
@@ -3329,7 +3381,11 @@ uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, 
         return 0;
     }
 
-    uint32 const desired = requestedCount > 0 ? requestedCount : 1;
+    // C-1: cap the buy count. requestedCount comes straight off the addon message, so an
+    // out-of-range value (e.g. a crafted 4e9) must never drive an unbounded buy loop on the
+    // world thread. A free/cheap stackable item would otherwise spin until bags fill.
+    static uint32 const kMaxBuyCount = 1000;
+    uint32 const desired = requestedCount > 0 ? std::min<uint32>(requestedCount, kMaxBuyCount) : 1;
     uint32 bought = 0;
     for (uint32 i = 0; i < desired; ++i)
     {
