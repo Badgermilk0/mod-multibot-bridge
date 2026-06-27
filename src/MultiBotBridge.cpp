@@ -104,12 +104,15 @@ bool TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& p
     if (payload.empty())
         return false;
 
-    if (payload.rfind(kAddonPrefix, 0) == 0)
-    {
-        payload.erase(0, std::char_traits<char>::length(kAddonPrefix));
-        while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
-            payload.erase(payload.begin());
-    }
+    // Require our own prefix. The addon always sends "MBOT\t<opcode>...", so refusing anything else
+    // keeps the bridge from inspecting (and, via OnPlayerCanUseChat, potentially suppressing) other
+    // addons' LANG_ADDON traffic that merely happens to share an opcode word.
+    if (payload.rfind(kAddonPrefix, 0) != 0)
+        return false;
+
+    payload.erase(0, std::char_traits<char>::length(kAddonPrefix));
+    while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
+        payload.erase(payload.begin());
 
     return !payload.empty();
 }
@@ -763,6 +766,9 @@ PvpStatsData BuildPvpStatsData(Player* bot)
     data.arenaPoints = bot->GetArenaPoints();
     data.honorPoints = bot->GetHonorPoints();
 
+    // Known cost: one synchronous CharacterDatabase query per bot. A group-wide GET~PVP_STATS fans
+    // this out across every visible bot in a single chat handler. Acceptable because it is a
+    // user-triggered panel refresh (not per-frame); revisit (batch/async) only if it ever shows up.
     QueryResult result = CharacterDatabase.Query(
         "SELECT at.type, at.name, at.rating "
         "FROM arena_team_member atm "
@@ -945,27 +951,18 @@ uint32 FindGlyphItemId(uint32 glyphId, uint32 spellId)
     if (!glyphId && !spellId)
         return 0;
 
-    static std::map<uint32, uint32> glyphItemCache;
-    uint32 const cacheKey = glyphId ? glyphId : spellId;
-    std::map<uint32, uint32>::const_iterator const cached = glyphItemCache.find(cacheKey);
-    if (cached != glyphItemCache.end())
-        return cached->second;
+    // Build the glyph item index once: a single class = 16 (glyph) item_template scan fills both
+    // spellId -> itemId and glyphId -> itemId, so every later lookup (across all bots) is O(1) with
+    // no further DB hits. Previously the fast path issued one WorldDatabase query per glyph slot on
+    // first panel open, and the glyphId fallback re-scanned the whole table each miss.
+    static bool initialized = false;
+    static std::map<uint32, uint32> spellToItem;
+    static std::map<uint32, uint32> glyphToItem;
 
-    uint32 itemId = 0;
-    if (spellId)
+    if (!initialized)
     {
-        QueryResult direct = WorldDatabase.Query(
-            "SELECT entry FROM item_template "
-            "WHERE class = 16 AND (spellid_1 = {} OR spellid_2 = {} OR spellid_3 = {} OR spellid_4 = {} OR spellid_5 = {}) "
-            "LIMIT 1",
-            spellId, spellId, spellId, spellId, spellId);
+        initialized = true;
 
-        if (direct)
-            itemId = direct->Fetch()[0].Get<uint32>();
-    }
-
-    if (!itemId && glyphId)
-    {
         QueryResult result = WorldDatabase.Query(
             "SELECT entry, spellid_1, spellid_2, spellid_3, spellid_4, spellid_5 "
             "FROM item_template WHERE class = 16");
@@ -974,7 +971,10 @@ uint32 FindGlyphItemId(uint32 glyphId, uint32 spellId)
         {
             do
             {
-                Field* fields = result->Fetch();
+                Field* const fields = result->Fetch();
+                uint32 const entry = fields[0].Get<uint32>();
+                if (!entry)
+                    continue;
 
                 for (uint8 i = 0; i < 5; ++i)
                 {
@@ -982,28 +982,39 @@ uint32 FindGlyphItemId(uint32 glyphId, uint32 spellId)
                     if (!itemSpellId)
                         continue;
 
+                    // First glyph item wins for a given spell/glyph (matches the old first-row match).
+                    spellToItem.emplace(itemSpellId, entry);
+
                     SpellInfo const* const itemSpellInfo = sSpellMgr->GetSpellInfo(itemSpellId);
                     if (!itemSpellInfo)
                         continue;
 
                     for (uint8 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
                     {
-                        if (itemSpellInfo->Effects[effectIndex].MiscValue == static_cast<int32>(glyphId))
-                        {
-                            itemId = fields[0].Get<uint32>();
-                            break;
-                        }
+                        int32 const misc = itemSpellInfo->Effects[effectIndex].MiscValue;
+                        if (misc > 0)
+                            glyphToItem.emplace(static_cast<uint32>(misc), entry);
                     }
-
-                    if (itemId)
-                        break;
                 }
-            } while (!itemId && result->NextRow());
+            } while (result->NextRow());
         }
     }
 
-    glyphItemCache[cacheKey] = itemId;
-    return itemId;
+    if (spellId)
+    {
+        std::map<uint32, uint32>::const_iterator const it = spellToItem.find(spellId);
+        if (it != spellToItem.end())
+            return it->second;
+    }
+
+    if (glyphId)
+    {
+        std::map<uint32, uint32>::const_iterator const it = glyphToItem.find(glyphId);
+        if (it != glyphToItem.end())
+            return it->second;
+    }
+
+    return 0;
 }
 
 void SendGlyphPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
@@ -1161,13 +1172,21 @@ void SendQuestPacketsForBot(Player* requester, ChatMsg replyType, Player* bot, s
     std::vector<QuestEntryData> const entries = BuildQuestEntries(bot, mode);
     for (QuestEntryData const& entry : entries)
     {
+        // Send the real quest title so the addon list shows the name, not the raw id. The client
+        // (ApplyQuestItemPayload) only falls back to the id when this field is empty, so a missing
+        // template still degrades gracefully.
+        Quest const* const questTemplate = sObjectMgr->GetQuestTemplate(entry.questId);
+        std::string questTitle = questTemplate ? questTemplate->GetTitle() : "";
+        if (questTitle.empty())
+            questTitle = std::to_string(entry.questId);
+
         std::ostringstream payload;
         payload << UrlEncodeField(botName)
             << kFieldSeparator << token
             << kFieldSeparator << mode
             << kFieldSeparator << (entry.completed ? "C" : "I")
             << kFieldSeparator << entry.questId
-            << kFieldSeparator << UrlEncodeField(std::to_string(entry.questId));
+            << kFieldSeparator << UrlEncodeField(questTitle);
 
         SendAddonPacket(requester, replyType, "QUESTS_ITEM", payload.str());
     }
@@ -2999,6 +3018,18 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
                 && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, dstSlot + 1))
             {
                 ++dstSlot;
+            }
+
+            // Titan's Grip (spell 49152) lets a warrior dual-wield two-handers: a second 2H weapon
+            // must go to the off hand. FindEquipSlot returns MAINHAND for both, so without this the
+            // second 2H in an outfit silently never equips. Mirrors the finger/trinket second-slot bump.
+            if (dstSlot == EQUIPMENT_SLOT_MAINHAND
+                && itemProto->InventoryType == INVTYPE_2HWEAPON
+                && bot->HasSpell(49152)
+                && bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND)
+                && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+            {
+                dstSlot = EQUIPMENT_SLOT_OFFHAND;
             }
 
             if (item->GetBagSlot() == INVENTORY_SLOT_BAG_0 && item->GetSlot() == dstSlot)
