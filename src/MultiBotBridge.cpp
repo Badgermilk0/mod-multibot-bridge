@@ -28,6 +28,8 @@
 #include "World.h"
 #include "WorldPacket.h"
 
+#include "Timer.h"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -39,6 +41,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -54,6 +57,17 @@ bool BridgeConsoleLogsEnabled()
     // Default off to match conf/MultiBotBridge.conf.dist (= 0). A true default made a
     // server that never copied the .conf log every RX/TX addon message.
     return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", false);
+}
+
+uint32 BridgeRequestsPerSecond()
+{
+    // 0 disables the per-player request throttle.
+    return sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestsPerSecond", 10);
+}
+
+uint32 BridgeRequestBurst()
+{
+    return sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestBurst", 20);
 }
 
 Player* FindBotByName(Player* player, std::string const& botName);
@@ -1567,7 +1581,13 @@ void BuildProfessionRecipeCastTargets(Player* bot, PlayerbotAI* botAI, SpellInfo
     {
         Item* item = nullptr;
         if (botAI && botAI->GetAiObjectContext())
-            item = botAI->GetAiObjectContext()->GetValue<Item*>("item for spell", spellInfo->Id)->Get();
+        {
+            // GetValue can return nullptr for an unregistered value name; the sibling
+            // AppendGameObject*/FindNearby* call sites all null-check it, so mirror that
+            // here instead of dereferencing unconditionally.
+            if (auto* const itemValue = botAI->GetAiObjectContext()->GetValue<Item*>("item for spell", spellInfo->Id))
+                item = itemValue->Get();
+        }
 
         targets.SetItemTarget(item);
     }
@@ -4498,6 +4518,18 @@ public:
         if (!TryExtractBridgePayload(lang, msg, payload))
             return false;
 
+        // The addon paces its own sends, but the server must not trust the client: several
+        // GET~ verbs run synchronous DB queries on the world thread (QUESTS fallback,
+        // PVP_STATS, GBANK rights), so an unthrottled sender could stall the server.
+        // Throttled messages are dropped silently (returning true suppresses the chat line);
+        // the addon-side request watchdog then surfaces the timeout.
+        if (!PassesRequestThrottle(player))
+        {
+            if (BridgeConsoleLogsEnabled())
+                LOG_INFO("playerbots", "MultiBotBridge RX throttled [{}] player={}", payload, player->GetName());
+            return true;
+        }
+
         if (BridgeConsoleLogsEnabled())
             LOG_INFO("playerbots", "MultiBotBridge RX [{}] type={}", payload, type);
 
@@ -4509,6 +4541,56 @@ public:
     {
         return !TryHandle(player, type, lang, msg);
     }
+
+private:
+    struct RequestBucket
+    {
+        double tokens = 0.0;
+        uint32 lastRefillMs = 0;
+    };
+
+    // Chat handling runs on the world thread, so no locking is needed here.
+    std::unordered_map<ObjectGuid, RequestBucket> _requestBuckets;
+
+    bool PassesRequestThrottle(Player* player)
+    {
+        uint32 const rate = BridgeRequestsPerSecond();
+        if (!rate)
+            return true;
+
+        uint32 const burst = std::max<uint32>(1, BridgeRequestBurst());
+        uint32 const now = getMSTime();
+
+        // Keep the map from growing with every player that ever sent a bridge message:
+        // once it is large, drop buckets idle for more than five minutes.
+        if (_requestBuckets.size() > 128)
+        {
+            uint32 const idleCutoffMs = 5u * 60u * 1000u;
+            for (auto it = _requestBuckets.begin(); it != _requestBuckets.end();)
+            {
+                if (it->first != player->GetGUID() && getMSTimeDiff(it->second.lastRefillMs, now) > idleCutoffMs)
+                    it = _requestBuckets.erase(it);
+                else
+                    ++it;
+            }
+        }
+
+        RequestBucket& bucket = _requestBuckets[player->GetGUID()];
+        if (bucket.lastRefillMs == 0)
+            bucket.tokens = static_cast<double>(burst);
+        else
+            bucket.tokens = std::min<double>(static_cast<double>(burst),
+                bucket.tokens + (static_cast<double>(getMSTimeDiff(bucket.lastRefillMs, now)) / 1000.0) * rate);
+        bucket.lastRefillMs = now;
+
+        if (bucket.tokens < 1.0)
+            return false;
+
+        bucket.tokens -= 1.0;
+        return true;
+    }
+
+public:
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Group* /*group*/) override
     {

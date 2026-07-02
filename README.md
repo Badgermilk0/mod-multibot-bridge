@@ -333,6 +333,12 @@ Server -> Addon:  MBOT STATE~<name>~<combatStrategies>~<nonCombatStrategies>    
 
 The exact payloads are consumed internally by the MultiBot addon.
 
+**Rate limiting.** Bridge requests are throttled per player with a token bucket
+(`MultiBotBridge.RequestsPerSecond`, default 10/s, and `MultiBotBridge.RequestBurst`,
+default 20, in `MultiBotBridge.conf`; set `RequestsPerSecond = 0` to disable). Requests
+beyond the budget are dropped silently — the addon's request watchdog surfaces the
+timeout on the client side.
+
 > **Version history**
 > - **v2** — `ROSTER` is streamed as `ROSTER_BEGIN`/`ROSTER_ITEM`/`ROSTER_END` (was a single
 >   `ROSTER~a;b;c` message that could be truncated for large raids); roster names are now

@@ -4,3 +4,12 @@
 # 1 = enabled
 # 0 = disabled
 MultiBotBridge.EnableConsoleLogs = 0
+
+# Per-player request throttle (token bucket). The addon paces its own sends, but the
+# server must not trust the client: some GET~ requests run synchronous DB queries on the
+# world thread. Messages beyond the budget are dropped silently; the addon's request
+# watchdog reports the timeout.
+# RequestsPerSecond: sustained requests per second per player (0 = throttle disabled).
+# RequestBurst: extra burst capacity (bootstrap / opening a full bot panel is ~10 requests).
+MultiBotBridge.RequestsPerSecond = 10
+MultiBotBridge.RequestBurst = 20
