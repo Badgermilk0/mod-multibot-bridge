@@ -1,6 +1,13 @@
 # MultiBotBridge module configuration
 #
+# These options are read once per config load (startup and `.reload config`), never per
+# addon packet.
+#
 # Enable bridge console logs (RX / TX / startup).
+# Bridge messages use the "multibotbridge" log filter. With no Logger.multibotbridge line in
+# worldserver.conf they fall back to Logger.root, which is enough to see them on the console;
+# add one to route them elsewhere, e.g.:
+#   Logger.multibotbridge = 4,Console Server
 # 1 = enabled
 # 0 = disabled
 MultiBotBridge.EnableConsoleLogs = 0

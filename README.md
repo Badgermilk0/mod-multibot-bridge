@@ -302,8 +302,16 @@ The bridge uses the `MBOT` addon-message prefix. The current **protocol version 
 
 **Framing.** A packet is `MBOT\t<OPCODE>~<payload>`. Fields inside a payload are separated
 by `~`. Any field that could contain a delimiter or a newline is percent-encoded (`%` `~`
-`\r` `\n` → `%XX`); the addon reverses this. Names are URL-encoded so they can never collide
-with a separator.
+`\r` `\n` → `%XX`); the addon reverses this. Free-text fields (item lines, quest titles,
+outfit names, error reasons) and the bot name in most streams are URL-encoded so they can
+never collide with a separator. The `INV_*`, `SB_*` and `STATE`/`STATES` streams send the
+bot name raw, and the addon reads it raw — safe on 3.3.5a, where a legal character name
+cannot contain `%`, `~`, `\r` or `\n`, but the two sides must stay aligned if that ever
+changes.
+
+**Unknown verbs.** A message that carries the `MBOT` prefix is always consumed by the bridge,
+never relayed on as ordinary addon chat. An unimplemented verb is answered with
+`ERR~UNKNOWN_OPCODE~<verb>`.
 
 **Streaming.** Any list that could exceed the addon-message length limit is sent as a
 `<NAME>_BEGIN` / `<NAME>_ITEM` (one per element) / `<NAME>_END` sequence rather than a single
@@ -345,6 +353,11 @@ timeout on the client side.
 >   URL-encoded; `DETAIL` and `STATE` streams always emit their `DETAILS`/`STATES` terminator.
 >   A v2 addon still accepts a v1 single-message `ROSTER` from an older bridge.
 > - **v1** — initial bridge protocol.
+>
+> Additive, still v2 (no bump — every existing opcode is byte-for-byte unchanged, so older v2
+> addons keep working): the bridge now answers unknown verbs with `ERR`, always terminates the
+> `PROFESSION` stream with `PROFESSIONS~` (it previously did so only when the batch was empty),
+> and ignores `RUN~OUTFIT`'s trailing persist flag — outfit writes are persisted unconditionally.
 
 ---
 
@@ -449,7 +462,9 @@ timeout on the client side.
   </tr>
   <tr>
     <td><code>RUN~OUTFIT</code></td>
-    <td>Run outfit create, update, reset, equip and replace actions through the bridge.</td>
+    <td>Run outfit create, update, reset, equip and replace actions through the bridge. Outfit
+    writes (<code>update</code> / <code>reset</code>) are persisted to the playerbots database
+    immediately, so they survive a bot relog.</td>
   </tr>
   <tr>
     <td><code>RUN~TRAINER_LEARN</code></td>
@@ -470,6 +485,11 @@ timeout on the client side.
   <tr>
     <td><code>RUN~LOOT</code></td>
     <td>Run whitelist-only loot rules and loot list commands without addon-side chat parsing.</td>
+  </tr>
+  <tr>
+    <td><code>ERR</code></td>
+    <td>Server-to-addon only. Sent when a well-formed <code>MBOT</code> message carries a verb
+    the bridge does not implement; the addon stores it in <code>MultiBot.bridge.lastError</code>.</td>
   </tr>
 </table>
 

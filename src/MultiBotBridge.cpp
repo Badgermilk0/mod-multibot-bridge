@@ -14,6 +14,7 @@
 #include "Player.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "PlayerbotRepository.h"
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
 #include "ReputationMgr.h"
@@ -42,6 +43,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -51,23 +53,49 @@ char const* const kAddonPrefix = "MBOT";
 char const* const kBridgeName = "mod-multibot-bridge";
 char const* const kProtocolVersion = "2"; // v2: ROSTER streamed (ROSTER_BEGIN/ITEM/END), DETAILS/STATES always terminated.
 char const kFieldSeparator = '~';
+// Own log filter rather than borrowing playerbots': an unconfigured filter falls back to
+// Logger.root, so bridge diagnostics stay visible even without a Logger.multibotbridge line.
+char const* const kLogFilter = "multibotbridge";
+
+struct BridgeConfigData
+{
+    // Defaults match conf/MultiBotBridge.conf.dist. A `true` console-log default made a
+    // server that never copied the .conf log every RX/TX addon message.
+    bool consoleLogs = false;
+    uint32 requestsPerSecond = 10; // 0 disables the per-player request throttle.
+    uint32 requestBurst = 20;
+};
+
+// Read once per config load instead of per addon packet. BridgeConsoleLogsEnabled() runs on
+// every RX and TX, so a 40-bot ROSTER stream used to cost 42 sConfigMgr lookups - and, on a
+// server that never copied MultiBotBridge.conf.dist, 42 "Missing property" warnings with them.
+BridgeConfigData& BridgeConfig()
+{
+    static BridgeConfigData config;
+    return config;
+}
+
+void LoadBridgeConfig()
+{
+    BridgeConfigData& config = BridgeConfig();
+    config.consoleLogs = sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", false);
+    config.requestsPerSecond = sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestsPerSecond", 10);
+    config.requestBurst = sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestBurst", 20);
+}
 
 bool BridgeConsoleLogsEnabled()
 {
-    // Default off to match conf/MultiBotBridge.conf.dist (= 0). A true default made a
-    // server that never copied the .conf log every RX/TX addon message.
-    return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", false);
+    return BridgeConfig().consoleLogs;
 }
 
 uint32 BridgeRequestsPerSecond()
 {
-    // 0 disables the per-player request throttle.
-    return sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestsPerSecond", 10);
+    return BridgeConfig().requestsPerSecond;
 }
 
 uint32 BridgeRequestBurst()
 {
-    return sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestBurst", 20);
+    return BridgeConfig().requestBurst;
 }
 
 Player* FindBotByName(Player* player, std::string const& botName);
@@ -867,7 +895,11 @@ std::string BuildTalentLinkPointSummary(std::string const& link)
 
 std::string GetPremadeSpecConfigString(std::string const& key)
 {
-    return Trim(sConfigMgr->GetOption<std::string>(key, ""));
+    // showLogs = false: these keys are *probed* across a fixed index/level range, and playerbots
+    // only defines ~6 spec names per class. With the default (true) a single GET~TALENT_SPEC_LIST
+    // emitted dozens of "Missing property AiPlayerbot.PremadeSpec*" warnings - a miss is expected
+    // here, not a misconfiguration.
+    return Trim(sConfigMgr->GetOption<std::string>(key, "", false));
 }
 
 std::string GetPremadeSpecLink(uint8 classId, uint32 specIndex, uint32 botLevel)
@@ -1142,6 +1174,12 @@ std::vector<QuestEntryData> BuildQuestEntries(Player* bot, std::string const& mo
     // Fallback DB uniquement si le quest log runtime est vide.
     // Certains forks stockent les quêtes actives avec un statut DB brut 0/1/3,
     // qui ne correspond pas toujours directement à l'enum runtime QuestStatus.
+    //
+    // Known cost (same shape as BuildPvpStatsData): one synchronous CharacterDatabase query on
+    // the world thread. A group-wide GET~QUESTS (empty bot name - the addon's "isGroup" path)
+    // fans this out across every visible bot whose runtime quest log came back empty.
+    // Acceptable because it is a user-triggered panel refresh, bounded by the request throttle,
+    // and only reached on the empty-log fallback; revisit (batch/async) only if it shows up.
 
     QueryResult result = CharacterDatabase.Query(
         "SELECT quest, status FROM character_queststatus WHERE guid = {}",
@@ -2832,24 +2870,16 @@ OutfitCommandParts ParseOutfitCommandSuffix(std::string const& suffix)
     return parts;
 }
 
+// Every allowed action is handled natively by ApplyBridgeNativeOutfitCommand, so this is both
+// the allow-list and the "the bridge can run it itself" test. It used to be duplicated as a
+// separate IsDirectBridgeOutfitCommandSuffix() guarding a legacy `outfit <suffix>` chat
+// fallback - the two predicates accepted the identical set, leaving that fallback unreachable.
 bool IsAllowedOutfitCommandSuffix(std::string const& suffix)
 {
     OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
     if (parts.name.empty())
         return false;
 
-    return parts.action == "EQUIP" || parts.action == "REPLACE" || parts.action == "UPDATE" || parts.action == "RESET";
-}
-
-bool IsUpdateOutfitCommandSuffix(std::string const& suffix)
-{
-    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
-    return parts.action == "UPDATE";
-}
-
-bool IsDirectBridgeOutfitCommandSuffix(std::string const& suffix)
-{
-    OutfitCommandParts const parts = ParseOutfitCommandSuffix(suffix);
     return parts.action == "EQUIP" || parts.action == "REPLACE" || parts.action == "UPDATE" || parts.action == "RESET";
 }
 
@@ -2877,6 +2907,12 @@ std::vector<uint32> CollectCurrentEquippedOutfitEntries(Player* bot)
     return std::vector<uint32>(uniqueEntries.begin(), uniqueEntries.end());
 }
 
+// Mutating the "outfit list" AI value only changes the bot's in-memory context. Playerbots'
+// own OutfitAction always follows a write with PlayerbotRepository::Save (which flushes the
+// whole context to the playerbots DB), so the bridge must too - otherwise an outfit saved or
+// deleted from the addon panel is silently lost the next time the bot's values are reloaded.
+// This used to be delegated to a `nc +chat` side effect in RunOutfitCommand (a strategy change
+// routes through ChangeStrategyAction -> Save), gated on a persist flag the addon never sets.
 bool SaveOutfitEntries(PlayerbotAI* botAI, std::string const& outfitName, std::vector<uint32> const& entries)
 {
     if (!botAI)
@@ -2904,19 +2940,21 @@ bool SaveOutfitEntries(PlayerbotAI* botAI, std::string const& outfitName, std::v
         }
     }
 
-    if (entries.empty())
-        return true;
-
-    std::ostringstream out;
-    out << name << '=';
-    for (std::size_t index = 0; index < entries.size(); ++index)
+    if (!entries.empty())
     {
-        if (index)
-            out << ',';
-        out << entries[index];
+        std::ostringstream out;
+        out << name << '=';
+        for (std::size_t index = 0; index < entries.size(); ++index)
+        {
+            if (index)
+                out << ',';
+            out << entries[index];
+        }
+
+        savedOutfits.push_back(out.str());
     }
 
-    savedOutfits.push_back(out.str());
+    PlayerbotRepository::instance().Save(botAI);
     return true;
 }
 
@@ -3538,7 +3576,9 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
     SendAddonPacket(requester, replyType, "PROFESSION_RECIPE_CRAFT", payload.str());
 }
 
-void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken)
+// persistToken is accepted for wire compatibility but ignored: SaveOutfitEntries now persists
+// unconditionally (see its comment), so UPDATE and RESET are durable whatever the addon sends.
+void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& /*persistToken*/)
 {
     std::string const trimmedBotName = Trim(botName);
     std::string const token = Trim(requestToken);
@@ -3548,15 +3588,7 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
 
     bool ok = false;
     if (bot && IsAllowedOutfitCommandSuffix(suffix))
-    {
-        if (IsDirectBridgeOutfitCommandSuffix(suffix))
-            ok = ApplyBridgeNativeOutfitCommand(bot, suffix);
-        else
-            ok = ExecuteSilentBotCommand(requester, bot, "outfit " + suffix);
-
-        if (ok && IsUpdateOutfitCommandSuffix(suffix) && Trim(persistToken) == "1")
-            ExecuteSilentBotCommand(requester, bot, "nc +chat");
-    }
+        ok = ApplyBridgeNativeOutfitCommand(bot, suffix);
 
     std::ostringstream payload;
     payload << UrlEncodeField(effectiveBotName)
@@ -3957,7 +3989,7 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
         wire += std::string(1, kFieldSeparator) + payload;
 
     if (BridgeConsoleLogsEnabled())
-        LOG_INFO("playerbots", "MultiBotBridge TX [{}] type={}", wire, static_cast<uint32>(chatType));
+        LOG_INFO(kLogFilter, "MultiBotBridge TX [{}] type={}", wire, static_cast<uint32>(chatType));
 
     WorldPacket data;
     ChatHandler::BuildChatPacket(data, chatType, LANG_ADDON, player, nullptr, wire.c_str());
@@ -4004,35 +4036,48 @@ bool CanExposeRandomHolderBot(Player* requester, Player* bot)
     return IsBotMasteredByRequester(requester, bot) || IsBotInRequesterGroup(requester, bot);
 }
 
-void AppendBridgeVisibleBot(Player* bot, std::vector<Player*>& bots, std::set<ObjectGuid>& seen)
+// Walks the requester's own bots plus every visible random/addclass bot, deduped by GUID,
+// invoking `handler` for each. Every enumeration goes through here; callers that only need
+// one bot (FindBotByName) use it directly instead of building a throwaway vector, because
+// the random-bot leg iterates every bot logged in on the server.
+template<typename Handler>
+void ForEachBridgeVisibleBot(Player* player, Handler handler)
 {
-    if (!bot)
+    if (!player)
         return;
 
-    if (!seen.insert(bot->GetGUID()).second)
-        return;
+    std::unordered_set<ObjectGuid> seen;
 
-    bots.push_back(bot);
+    auto const visit = [&handler, &seen](Player* bot) -> bool
+    {
+        if (!bot || !seen.insert(bot->GetGUID()).second)
+            return true;
+
+        return handler(bot);
+    };
+
+    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+            if (!visit(it->second))
+                return;
+
+    for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+    {
+        Player* const bot = it->second;
+        if (CanExposeRandomHolderBot(player, bot) && !visit(bot))
+            return;
+    }
 }
 
 std::vector<Player*> GetBridgeVisibleBots(Player* player)
 {
     std::vector<Player*> bots;
-    std::set<ObjectGuid> seen;
 
-    if (!player)
-        return bots;
-
-    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
-            AppendBridgeVisibleBot(it->second, bots, seen);
-
-    for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+    ForEachBridgeVisibleBot(player, [&bots](Player* bot)
     {
-        Player* const bot = it->second;
-        if (CanExposeRandomHolderBot(player, bot))
-            AppendBridgeVisibleBot(bot, bots, seen);
-    }
+        bots.push_back(bot);
+        return true;
+    });
 
     return bots;
 }
@@ -4043,13 +4088,17 @@ Player* FindBotByName(Player* player, std::string const& botName)
     if (wantedName.empty())
         return nullptr;
 
-    for (Player* const bot : GetBridgeVisibleBots(player))
+    Player* found = nullptr;
+    ForEachBridgeVisibleBot(player, [&found, &wantedName](Player* bot)
     {
-        if (bot->GetName() == wantedName)
-            return bot;
-    }
+        if (bot->GetName() != wantedName)
+            return true;
 
-    return nullptr;
+        found = bot;
+        return false; // stop the walk
+    });
+
+    return found;
 }
 
 std::string JoinStrategies(std::vector<std::string> const& strategies)
@@ -4129,7 +4178,6 @@ std::string BuildProfessionPayload(Player* player, std::string const& botName)
 
 void SendProfessionPackets(Player* player, ChatMsg replyType)
 {
-    bool sent = false;
     for (Player* const bot : GetBridgeVisibleBots(player))
     {
         std::string const payload = BuildBotProfessionPayload(bot);
@@ -4137,11 +4185,11 @@ void SendProfessionPackets(Player* player, ChatMsg replyType)
             continue;
 
         SendAddonPacket(player, replyType, "PROFESSION", payload);
-        sent = true;
     }
 
-    if (!sent)
-        SendAddonPacket(player, replyType, "PROFESSIONS", "");
+    // C2: always terminate the stream, matching DETAILS/STATES. This used to fire only when
+    // no bot produced a payload, so a non-empty batch never told the client it was complete.
+    SendAddonPacket(player, replyType, "PROFESSIONS", "");
 }
 
 std::string BuildPvpStatsPayload(Player* player, std::string const& botName)
@@ -4507,7 +4555,14 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 class MultiBotBridgePlayerScript final : public PlayerScript
 {
 public:
-    MultiBotBridgePlayerScript() : PlayerScript("MultiBotBridgePlayerScript") {}
+    // Register only the chat hooks that are actually overridden. An empty hook list means
+    // "enable all", and because the dispatch macros fast-path on an *empty* hook container,
+    // that made the bridge a per-call participant in every player hook on the server (kills,
+    // XP, movement, loot, ...) just to read addon chat. The plain OnPlayerCanUseChat overload
+    // (say/yell) is deliberately absent: the addon only sends over WHISPER/PARTY/RAID.
+    MultiBotBridgePlayerScript() : PlayerScript("MultiBotBridgePlayerScript",
+        { PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT, PLAYERHOOK_CAN_PLAYER_USE_GROUP_CHAT,
+          PLAYERHOOK_CAN_PLAYER_USE_GUILD_CHAT, PLAYERHOOK_CAN_PLAYER_USE_CHANNEL_CHAT }) {}
 
     bool TryHandle(Player* player, uint32 type, uint32 lang, std::string& msg)
     {
@@ -4526,15 +4581,23 @@ public:
         if (!PassesRequestThrottle(player))
         {
             if (BridgeConsoleLogsEnabled())
-                LOG_INFO("playerbots", "MultiBotBridge RX throttled [{}] player={}", payload, player->GetName());
+                LOG_INFO(kLogFilter, "MultiBotBridge RX throttled [{}] player={}", payload, player->GetName());
             return true;
         }
 
         if (BridgeConsoleLogsEnabled())
-            LOG_INFO("playerbots", "MultiBotBridge RX [{}] type={}", payload, type);
+            LOG_INFO(kLogFilter, "MultiBotBridge RX [{}] type={}", payload, type);
 
+        ChatMsg const replyType = NormalizeReplyChatType(type);
         std::pair<std::string, std::string> const packet = SplitOnce(payload, kFieldSeparator);
-        return HandleBridgeOpcode(player, NormalizeReplyChatType(type), packet.first, packet.second);
+        if (HandleBridgeOpcode(player, replyType, packet.first, packet.second))
+            return true;
+
+        // TryExtractBridgePayload already proved the MBOT prefix is ours, so an unknown verb
+        // must still be swallowed - letting it fall through relays the raw message on to the
+        // party/raid/guild as ordinary addon traffic. The addon stores ERR in bridge.lastError.
+        SendAddonPacket(player, replyType, "ERR", UrlEncodeField("UNKNOWN_OPCODE") + std::string(1, kFieldSeparator) + UrlEncodeField(Trim(packet.first)));
+        return true;
     }
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* /*receiver*/) override
@@ -4607,11 +4670,26 @@ public:
         return !TryHandle(player, type, lang, msg);
     }
 };
+
+// Owns the cached config. OnAfterConfigLoad fires both at startup and on `.reload config`,
+// so the cache can never go stale while keeping sConfigMgr off the per-packet path.
+class MultiBotBridgeWorldScript final : public WorldScript
+{
+public:
+    MultiBotBridgeWorldScript() : WorldScript("MultiBotBridgeWorldScript", { WORLDHOOK_ON_AFTER_CONFIG_LOAD }) {}
+
+    void OnAfterConfigLoad(bool reload) override
+    {
+        LoadBridgeConfig();
+
+        if (!reload && BridgeConsoleLogsEnabled())
+            LOG_INFO("server.loading", "mod-multibot-bridge loaded");
+    }
+};
 } // namespace
 
 void AddSC_multibot_bridge()
 {
-    if (BridgeConsoleLogsEnabled())
-        LOG_INFO("server.loading", "mod-multibot-bridge loaded");
+    new MultiBotBridgeWorldScript();
     new MultiBotBridgePlayerScript();
 }
