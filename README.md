@@ -358,6 +358,9 @@ timeout on the client side.
 > addons keep working): the bridge now answers unknown verbs with `ERR`, always terminates the
 > `PROFESSION` stream with `PROFESSIONS~` (it previously did so only when the batch was empty),
 > and ignores `RUN~OUTFIT`'s trailing persist flag — outfit writes are persisted unconditionally.
+> It also adds `GET~RTSC` (`RTSC_BEGIN`/`RTSC_ITEM`/`RTSC_END`) and `RUN~RTSC` (`RTSC_ACK`) for
+> playerbots' RTS-control feature; both are new opcodes, so a v2 addon that does not know them is
+> unaffected.
 
 ---
 
@@ -485,6 +488,26 @@ timeout on the client side.
   <tr>
     <td><code>RUN~LOOT</code></td>
     <td>Run whitelist-only loot rules and loot list commands without addon-side chat parsing.</td>
+  </tr>
+  <tr>
+    <td><code>GET~RTSC</code></td>
+    <td>Read each bot's RTS-control state — selected flag, armed next-cast action, and the names of
+    its saved locations. Streamed as <code>RTSC_BEGIN</code> / <code>RTSC_ITEM</code> /
+    <code>RTSC_END</code>. Replaces playerbots' <code>rtsc show</code>, which answers by whisper.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~RTSC</code></td>
+    <td>Run whitelist-only RTS-control commands (<code>enable</code>, <code>select</code>,
+    <code>cancel</code>, <code>toggle</code>, <code>reset</code>, <code>move</code>,
+    <code>last</code>, <code>show</code>, <code>go|show|save|unsave &lt;name&gt;</code>,
+    <code>save here|selected &lt;name&gt;</code>), optionally prefixed with one playerbots chat
+    filter such as <code>@tank</code> or <code>@group1-3</code>. Two sub-commands are bridge-only:
+    <code>persist</code> flushes a bot's context to the playerbots DB (an armed
+    <code>save</code> lands inside <code>SeeSpellAction</code>, which the bridge never sees), and
+    <code>here</code> seeds <code>see spell location</code> with the requester's own position and
+    replays it via <code>rtsc last</code>, regrouping the bots on the player in formation without
+    any spell cast. Note the marker position itself can still only reach a bot through a real
+    ground cast of spell 30758 from the master's client.</td>
   </tr>
   <tr>
     <td><code>ERR</code></td>

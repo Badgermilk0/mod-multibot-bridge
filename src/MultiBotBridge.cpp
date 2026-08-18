@@ -18,6 +18,7 @@
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
 #include "ReputationMgr.h"
+#include "RTSCValues.h"
 #include "AiObjectContext.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
@@ -3963,6 +3964,287 @@ void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& sco
     SendAddonPacket(requester, replyType, "LOOT_ACK", payload.str());
 }
 
+// RTSC ("RTS control") is playerbots' click-to-command feature. Its whole chat surface is the
+// single `rtsc` command: none of its sub-commands carry coordinates, they only *arm* what the
+// master's next `aedm` ground cast (spell 30758) will do, or replay an already stored point.
+// The position itself can only reach a bot through SeeSpellAction, i.e. a real CMSG_CAST_SPELL
+// from the master's client - which is why the addon still needs its /cast button.
+std::string const kRtscSavedLocationPrefix = "RTSC saved location::";
+
+bool IsValidRTSCLocationName(std::string const& name)
+{
+    if (name.empty() || name.size() > 16)
+        return false;
+
+    for (char const c : name)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+            return false;
+
+    return true;
+}
+
+// Playerbots' chat filters (@tank, @group1-3, @skull, ...) are applied inside
+// PlayerbotAI::HandleCommand, so they work over the bridge's silent-whisper path exactly as they
+// do over party chat - the tag only has to survive validation intact.
+bool IsValidRTSCSelector(std::string const& selector)
+{
+    if (selector.size() < 2 || selector.size() > 24 || selector[0] != '@')
+        return false;
+
+    for (std::size_t index = 1; index < selector.size(); ++index)
+    {
+        char const c = selector[index];
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != ',' && c != '-')
+            return false;
+    }
+
+    return true;
+}
+
+// Splits "<@selector> <sub-command>" into its two halves; the selector is optional.
+bool SplitRTSCCommand(std::string const& command, std::string& selector, std::string& sub)
+{
+    std::string const trimmed = Trim(command);
+    selector.clear();
+    sub.clear();
+
+    if (!trimmed.empty() && trimmed[0] == '@')
+    {
+        std::pair<std::string, std::string> const parts = SplitOnce(trimmed, ' ');
+        if (!IsValidRTSCSelector(Trim(parts.first)))
+            return false;
+
+        selector = Trim(parts.first);
+        sub = Trim(parts.second);
+    }
+    else
+        sub = trimmed;
+
+    return !sub.empty();
+}
+
+// RTSCAction matches its sub-commands with find(...) != npos but slices the argument with a fixed
+// substr() offset, so anything that is not an exact prefix produces a garbage location name.
+// Rebuilding the command from validated tokens keeps that quirk unreachable from the addon.
+// Returns "" for anything not recognised - callers gate on the empty string.
+std::string NormalizeRTSCCommand(std::string const& command)
+{
+    std::string selector;
+    std::string sub;
+
+    if (!SplitRTSCCommand(command, selector, sub))
+        return "";
+
+    std::transform(sub.begin(), sub.end(), sub.begin(), [](unsigned char c)
+    {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    std::istringstream in(sub);
+    std::vector<std::string> parts;
+    std::string part;
+
+    while (in >> part)
+        parts.push_back(part);
+
+    if (parts.empty())
+        return "";
+
+    // "enable" stands in for playerbots' bare `rtsc` (which trains the master's aedm spell);
+    // "persist" and "here" are bridge-side only and never reach RTSCAction as written.
+    static std::set<std::string> const bare =
+    {
+        "enable", "select", "cancel", "toggle", "reset", "move", "last", "show", "persist", "here"
+    };
+
+    std::string normalized;
+
+    if (parts.size() == 1 && bare.find(parts[0]) != bare.end())
+        normalized = parts[0];
+    else if (parts.size() == 2 && IsValidRTSCLocationName(parts[1]) &&
+        (parts[0] == "go" || parts[0] == "show" || parts[0] == "save" || parts[0] == "unsave"))
+        normalized = parts[0] + " " + parts[1];
+    else if (parts.size() == 3 && parts[0] == "save" && IsValidRTSCLocationName(parts[2]) &&
+        (parts[1] == "here" || parts[1] == "selected"))
+        normalized = parts[0] + " " + parts[1] + " " + parts[2];
+    else
+        return "";
+
+    if (selector.empty())
+        return normalized;
+
+    // The two bridge-side sub-commands act before (and instead of) the chat filter, so a selector
+    // on them would silently apply to bots the filter would have dropped. Use the scope instead.
+    if (normalized == "persist" || normalized == "here")
+        return "";
+
+    return selector + " " + normalized;
+}
+
+// An armed `save <name>` only lands when the master's next ground cast reaches SeeSpellAction,
+// which the bridge never sees. Context writes are memory-only until PlayerbotRepository::Save runs
+// (playerbots itself only triggers that from co/nc commands), so the addon calls `persist` once it
+// has observed the cast and the bridge flushes - same reasoning as SaveOutfitEntries above.
+bool ApplyNativeRTSCPersist(PlayerbotAI* botAI)
+{
+    if (!botAI || !botAI->GetAiObjectContext())
+        return false;
+
+    PlayerbotRepository::instance().Save(botAI);
+    return true;
+}
+
+// "here" has no chat equivalent: it seeds `see spell location` with the requester's own position
+// so the follow-up `rtsc last` replays it through MoveToSpell (which applies the bot's formation
+// offset). Net effect - the group regroups on the player, without the master casting anything.
+bool ApplyNativeRTSCHere(Player* requester, PlayerbotAI* botAI)
+{
+    if (!requester || !botAI)
+        return false;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    Value<WorldPosition>* const seeSpellLocation = context->GetValue<WorldPosition>("see spell location");
+    if (!seeSpellLocation)
+        return false;
+
+    seeSpellLocation->Set(WorldPosition(requester));
+    return true;
+}
+
+void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const command = NormalizeRTSCCommand(UrlDecodeField(encodedCommand));
+    uint32 executed = 0;
+
+    if (!command.empty() && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    {
+        std::string selector;
+        std::string sub;
+        SplitRTSCCommand(command, selector, sub);
+
+        for (Player* const bot : GetBridgeVisibleBots(requester))
+        {
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
+                continue;
+
+            PlayerbotAI* const botAI = GetBotAI(bot);
+            if (!botAI)
+                continue;
+
+            if (sub == "persist")
+            {
+                if (ApplyNativeRTSCPersist(botAI))
+                    ++executed;
+
+                continue;
+            }
+
+            if (sub == "here" && !ApplyNativeRTSCHere(requester, botAI))
+                continue;
+
+            std::string const forwarded = sub == "here" ? "last" : sub;
+            std::string line = selector.empty() ? "rtsc" : (selector + " rtsc");
+            if (forwarded != "enable")
+                line += " " + forwarded;
+
+            if (!ExecuteSilentBotCommand(requester, bot, line))
+                continue;
+
+            ++executed;
+
+            // These three write straight into the context; without the flush they are lost the
+            // next time the bot's values are reloaded.
+            if (sub == "reset" || sub.rfind("unsave ", 0) == 0 || sub.rfind("save here ", 0) == 0)
+                PlayerbotRepository::instance().Save(botAI);
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, "RTSC_ACK", payload.str());
+}
+
+// Streamed like the roster so a full raid can never overflow one addon message. This is the
+// chatless replacement for `rtsc show`, which answers with a whisper the addon must not parse.
+void SendRtscPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
+{
+    std::string const requestedBotName = Trim(botNameValue);
+    std::string const token = Trim(tokenValue);
+
+    SendAddonPacket(requester, replyType, "RTSC_BEGIN", token);
+
+    std::vector<Player*> bots;
+    if (requestedBotName.empty())
+        bots = GetBridgeVisibleBots(requester);
+    else if (Player* const bot = FindBotByName(requester, requestedBotName))
+        bots.push_back(bot);
+
+    for (Player* const bot : bots)
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI)
+            continue;
+
+        AiObjectContext* const context = botAI->GetAiObjectContext();
+        if (!context)
+            continue;
+
+        Value<bool>* const selectedValue = context->GetValue<bool>("RTSC selected");
+        Value<std::string>* const armedValue = context->GetValue<std::string>("RTSC next spell action");
+
+        bool const selected = selectedValue && selectedValue->Get();
+        std::string const armed = armedValue ? Trim(armedValue->Get()) : "";
+
+        // GetValues() lists only the values the bot actually created, so this enumerates the saved
+        // spots without materialising empty ones. A location that never received a real position
+        // reads as falsy - the same test `rtsc show` uses.
+        std::ostringstream names;
+        bool first = true;
+
+        for (std::string const& value : context->GetValues())
+        {
+            if (value.rfind(kRtscSavedLocationPrefix, 0) != 0)
+                continue;
+
+            std::string const name = value.substr(kRtscSavedLocationPrefix.size());
+            if (name.empty())
+                continue;
+
+            Value<WorldPosition>* const saved = context->GetValue<WorldPosition>("RTSC saved location", name);
+            if (!saved || !saved->Get())
+                continue;
+
+            if (!first)
+                names << ',';
+
+            names << name;
+            first = false;
+        }
+
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName())
+            << kFieldSeparator << token
+            << kFieldSeparator << (selected ? 1 : 0)
+            << kFieldSeparator << UrlEncodeField(armed)
+            << kFieldSeparator << UrlEncodeField(names.str());
+
+        SendAddonPacket(requester, replyType, "RTSC_ITEM", payload.str());
+    }
+
+    SendAddonPacket(requester, replyType, "RTSC_END", token);
+}
+
 ChatMsg NormalizeReplyChatType(uint32 type)
 {
     switch (type)
@@ -4460,6 +4742,13 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "RTSC")
+        {
+            std::pair<std::string, std::string> const rtscRequest = SplitOnce(request.second, kFieldSeparator);
+            SendRtscPackets(player, replyType, rtscRequest.first, Trim(rtscRequest.second));
+            return true;
+        }
+
         return false;
     }
 
@@ -4543,6 +4832,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
 
             RunRTICommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
+            return true;
+        }
+
+        if (requestType == "RTSC")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunRTSCCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
