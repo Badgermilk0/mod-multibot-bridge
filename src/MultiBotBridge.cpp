@@ -4051,10 +4051,12 @@ std::string NormalizeRTSCCommand(std::string const& command)
         return "";
 
     // "enable" stands in for playerbots' bare `rtsc` (which trains the master's aedm spell);
-    // "persist" and "here" are bridge-side only and never reach RTSCAction as written.
+    // "persist", "here", "lock" and "unlock" are bridge-side only and never reach RTSCAction as
+    // written.
     static std::set<std::string> const bare =
     {
-        "enable", "select", "cancel", "toggle", "reset", "move", "last", "show", "persist", "here"
+        "enable", "select", "cancel", "toggle", "reset", "move", "last", "show", "persist", "here",
+        "lock", "unlock"
     };
 
     std::string normalized;
@@ -4073,9 +4075,10 @@ std::string NormalizeRTSCCommand(std::string const& command)
     if (selector.empty())
         return normalized;
 
-    // The two bridge-side sub-commands act before (and instead of) the chat filter, so a selector
-    // on them would silently apply to bots the filter would have dropped. Use the scope instead.
-    if (normalized == "persist" || normalized == "here")
+    // The bridge-side sub-commands act before (and instead of) the chat filter, so a selector on
+    // them would silently apply to bots the filter would have dropped. Use the scope instead.
+    if (normalized == "persist" || normalized == "here" || normalized == "lock" ||
+        normalized == "unlock")
         return "";
 
     return selector + " " + normalized;
@@ -4114,6 +4117,30 @@ bool ApplyNativeRTSCHere(Player* requester, PlayerbotAI* botAI)
     return true;
 }
 
+// The selection lock is a per-bot flag playerbots reads in SeeSpellAction's rubber-band branch:
+// while it is set, a plain marker cast moves the selected bots without rewriting anyone's
+// "RTSC selected". Without it the cast replaces the whole selection with "was within 10 yards of
+// the click", so the bots being sent are dropped and the bystanders at the destination join - and
+// no client-side repair can win that race reliably, because a chat command queued by the addon is
+// applied in HandleCommands(), which PlayerbotAI::UpdateAIInternal runs *before* the master packet
+// queue that carries the cast. Bridge-side only: there is no RTSCAction sub-command for it.
+bool ApplyNativeRTSCSelectionLock(PlayerbotAI* botAI, bool locked)
+{
+    if (!botAI)
+        return false;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    Value<bool>* const lock = context->GetValue<bool>("RTSC selection locked");
+    if (!lock)
+        return false;
+
+    lock->Set(locked);
+    return true;
+}
+
 void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
@@ -4140,6 +4167,14 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
             if (sub == "persist")
             {
                 if (ApplyNativeRTSCPersist(botAI))
+                    ++executed;
+
+                continue;
+            }
+
+            if (sub == "lock" || sub == "unlock")
+            {
+                if (ApplyNativeRTSCSelectionLock(botAI, sub == "lock"))
                     ++executed;
 
                 continue;

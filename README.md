@@ -361,6 +361,14 @@ timeout on the client side.
 > It also adds `GET~RTSC` (`RTSC_BEGIN`/`RTSC_ITEM`/`RTSC_END`) and `RUN~RTSC` (`RTSC_ACK`) for
 > playerbots' RTS-control feature; both are new opcodes, so a v2 addon that does not know them is
 > unaffected.
+>
+> Additive, still v2: `RUN~RTSC` accepts two further bridge-only sub-commands, `lock` and
+> `unlock`, which set playerbots' `RTSC selection locked` flag. While it is set, a plain marker
+> cast moves the selected bots without rewriting anybody's `RTSC selected` — the fix for the
+> rubber-band branch silently swapping an explicit role/group selection for "whoever stood within
+> 10 yards of the click". They need the matching `RTSCSelectionLockedValue` in mod-playerbots; on a
+> worldserver without it the flag does not exist, `RTSC_ACK` reports `executed = 0`, and the addon
+> falls back to re-asserting the selection after each cast.
 
 ---
 
@@ -506,8 +514,10 @@ timeout on the client side.
     <code>save</code> lands inside <code>SeeSpellAction</code>, which the bridge never sees), and
     <code>here</code> seeds <code>see spell location</code> with the requester's own position and
     replays it via <code>rtsc last</code>, regrouping the bots on the player in formation without
-    any spell cast. Note the marker position itself can still only reach a bot through a real
-    ground cast of spell 30758 from the master's client.</td>
+    any spell cast. <code>lock</code> / <code>unlock</code> set playerbots'
+    <code>RTSC selection locked</code> flag, which stops a plain marker cast from replacing the
+    selection with "whoever was within 10 yards of the click". Note the marker position itself can
+    still only reach a bot through a real ground cast of spell 30758 from the master's client.</td>
   </tr>
   <tr>
     <td><code>ERR</code></td>
