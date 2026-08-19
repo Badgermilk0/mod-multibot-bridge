@@ -4222,7 +4222,20 @@ void SendRtscPackets(Player* requester, ChatMsg replyType, std::string const& bo
                 continue;
 
             Value<WorldPosition>* const saved = context->GetValue<WorldPosition>("RTSC saved location", name);
-            if (!saved || !saved->Get())
+            if (!saved)
+                continue;
+
+            // NOT `!saved->Get()`: WorldPosition::operator bool() is `mapId != 0 || x/y/z != 0`,
+            // and a default-constructed one carries MAPID_INVALID (0xFFFFFFFF), so it reports as
+            // a real location. That made every slot the bots had ever *touched* look occupied and
+            // `unsave` look like it did nothing - RESET_AI_VALUE2 restores exactly that truthy
+            // default. Test for a usable position instead.
+            WorldPosition const position = saved->Get();
+            if (position.GetMapId() == MAPID_INVALID)
+                continue;
+
+            if (position.GetPositionX() == 0.0f && position.GetPositionY() == 0.0f &&
+                position.GetPositionZ() == 0.0f)
                 continue;
 
             if (!first)
