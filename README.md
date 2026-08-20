@@ -367,8 +367,8 @@ timeout on the client side.
 > cast moves the selected bots without rewriting anybody's `RTSC selected` — the fix for the
 > rubber-band branch silently swapping an explicit role/group selection for "whoever stood within
 > 10 yards of the click". They need the matching `RTSCSelectionLockedValue` in mod-playerbots; on a
-> worldserver without it the flag does not exist, `RTSC_ACK` reports `executed = 0`, and the addon
-> falls back to re-asserting the selection after each cast.
+> worldserver without it the flag does not exist, no bot applies it, and the addon falls back to
+> re-asserting the selection after each cast.
 >
 > Additive, still v2: `RUN~RTSC` accepts two more bridge-only sub-commands, `force` and `unforce`,
 > which set playerbots' `RTSC force enabled` flag. While it is set, an RTSC move is carried out to
@@ -376,8 +376,25 @@ timeout on the client side.
 > destination and moves at `MOVEMENT_FORCED` until it arrives, still fighting back on the way.
 > `unforce` also clears any destination in flight, so it is the abort. They need the matching
 > `RTSCForceEnabledValue` / `RTSCForceMoveAction` in mod-playerbots; without them the value does
-> not exist, `RTSC_ACK` reports `executed = 0`, and the addon greys its Force button. No opcode or
-> payload changed — `RTSC_ITEM` still carries its five fields and does not report the flag.
+> not exist, no bot applies the flag, and the addon greys its Force button. `RTSC_ITEM` still
+> carries its five fields and does not report the flag.
+>
+> Additive, still v2: `RTSC_ACK` gained a sixth field, `considered`, appended after the
+> URL-encoded command —
+> `scope~target~token~executed~command~considered`. It is how many bots the command was actually
+> offered to (matched the scope and had a `PlayerbotAI`), and it exists because `executed = 0`
+> alone cannot distinguish the two reasons nothing ran:
+>
+> | `considered` | `executed` | meaning |
+> |---|---|---|
+> | `0` | `0` | No bots. Says nothing about support — the addon must not draw a conclusion. |
+> | `> 0` | `0` | Bots were asked and none could apply it → the worldserver lacks the feature. |
+> | `> 0` | `> 0` | Applied. |
+>
+> Without it, opening the addon's RTSC bar with no bots out probed `force`, read the `0` as
+> "unsupported", and disabled the feature for the rest of the session. Appending is safe because
+> `command` is URL-encoded and can never contain a separator; an older addon that stops reading
+> after it is unaffected.
 
 ---
 
@@ -529,8 +546,12 @@ timeout on the client side.
     <code>unforce</code> set playerbots' <code>RTSC force enabled</code> flag, which makes a move
     run to completion (remembered destination, re-issued at <code>MOVEMENT_FORCED</code>) instead
     of being abandoned as soon as something aggroes; <code>unforce</code> also aborts a move in
-    progress. Note the marker position itself can still only reach a bot through a real ground cast
-    of spell 30758 from the master's client.</td>
+    progress. Answers with <code>RTSC_ACK</code>
+    (<code>scope~target~token~executed~command~considered</code>): <code>considered</code> is how
+    many bots the command was offered to, so <code>0</code> of <code>0</code> ("no bots") stays
+    distinguishable from <code>0</code> of <code>N</code> ("this worldserver cannot do it"). Note
+    the marker position itself can still only reach a bot through a real ground cast of spell 30758
+    from the master's client.</td>
   </tr>
   <tr>
     <td><code>ERR</code></td>

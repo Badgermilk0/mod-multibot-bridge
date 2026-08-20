@@ -4150,7 +4150,9 @@ bool ApplyNativeRTSCSelectionLock(PlayerbotAI* botAI, bool locked)
 // movement is monopolised. Clearing the flag also clears the destination, which is the abort.
 // Bridge-side only: there is no RTSCAction sub-command for it. Needs the matching
 // RTSCForceEnabledValue in mod-playerbots - on a worldserver without it the value does not exist,
-// so this reports 0 executed and the addon falls back to telling the user.
+// so this reports 0 executed out of a non-zero `considered` and the addon greys the button. With
+// no bots at all `considered` is 0 too, which means "nothing was asked" and says nothing about
+// support - see the RTSC_ACK note in RunRTSCCommand.
 bool ApplyNativeRTSCForce(PlayerbotAI* botAI, bool enabled)
 {
     if (!botAI)
@@ -4174,8 +4176,16 @@ bool ApplyNativeRTSCForce(PlayerbotAI* botAI, bool enabled)
         botAI->ChangeStrategy("+rtsc", BOT_STATE_COMBAT);
         botAI->ChangeStrategy("+rtsc", BOT_STATE_NON_COMBAT);
     }
-    else if (Value<WorldPosition>* const destination = context->GetValue<WorldPosition>("RTSC forced destination"))
-        destination->Reset();
+    else
+    {
+        // Unforce is also the abort: drop the destination *and* its deadline, or the next forced
+        // move inherits a deadline stamped for the previous one and gives up early.
+        if (Value<WorldPosition>* const destination = context->GetValue<WorldPosition>("RTSC forced destination"))
+            destination->Reset();
+
+        if (Value<uint32>* const deadline = context->GetValue<uint32>("RTSC forced deadline"))
+            deadline->Reset();
+    }
 
     return true;
 }
@@ -4187,6 +4197,12 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
     std::string const token = Trim(requestToken);
     std::string const command = NormalizeRTSCCommand(UrlDecodeField(encodedCommand));
     uint32 executed = 0;
+    // How many bots the command was actually offered to. `executed` alone cannot tell "no bot ran
+    // it because none of them knows this sub-command" from "no bot ran it because there are no
+    // bots", and the addon used the first reading for both - so opening the RTSC bar with an empty
+    // pool permanently disabled its Force button. With the denominator on the wire, 0 of 0 means
+    // "nothing was asked" and only 0 of N is evidence about support.
+    uint32 considered = 0;
 
     if (!command.empty() && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
@@ -4202,6 +4218,8 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
             PlayerbotAI* const botAI = GetBotAI(bot);
             if (!botAI)
                 continue;
+
+            ++considered;
 
             if (sub == "persist")
             {
@@ -4247,12 +4265,15 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
         }
     }
 
+    // `considered` is appended rather than inserted: the command field is url-encoded, so it can
+    // never contain a separator, and a reader that stops after it is unaffected.
     std::ostringstream payload;
     payload << scope
         << kFieldSeparator << UrlEncodeField(target)
         << kFieldSeparator << token
         << kFieldSeparator << executed
-        << kFieldSeparator << UrlEncodeField(command);
+        << kFieldSeparator << UrlEncodeField(command)
+        << kFieldSeparator << considered;
 
     SendAddonPacket(requester, replyType, "RTSC_ACK", payload.str());
 }
