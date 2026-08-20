@@ -369,6 +369,15 @@ timeout on the client side.
 > 10 yards of the click". They need the matching `RTSCSelectionLockedValue` in mod-playerbots; on a
 > worldserver without it the flag does not exist, `RTSC_ACK` reports `executed = 0`, and the addon
 > falls back to re-asserting the selection after each cast.
+>
+> Additive, still v2: `RUN~RTSC` accepts two more bridge-only sub-commands, `force` and `unforce`,
+> which set playerbots' `RTSC force enabled` flag. While it is set, an RTSC move is carried out to
+> completion instead of being abandoned to the first combat chase — the bot remembers the
+> destination and moves at `MOVEMENT_FORCED` until it arrives, still fighting back on the way.
+> `unforce` also clears any destination in flight, so it is the abort. They need the matching
+> `RTSCForceEnabledValue` / `RTSCForceMoveAction` in mod-playerbots; without them the value does
+> not exist, `RTSC_ACK` reports `executed = 0`, and the addon greys its Force button. No opcode or
+> payload changed — `RTSC_ITEM` still carries its five fields and does not report the flag.
 
 ---
 
@@ -516,8 +525,12 @@ timeout on the client side.
     replays it via <code>rtsc last</code>, regrouping the bots on the player in formation without
     any spell cast. <code>lock</code> / <code>unlock</code> set playerbots'
     <code>RTSC selection locked</code> flag, which stops a plain marker cast from replacing the
-    selection with "whoever was within 10 yards of the click". Note the marker position itself can
-    still only reach a bot through a real ground cast of spell 30758 from the master's client.</td>
+    selection with "whoever was within 10 yards of the click". <code>force</code> /
+    <code>unforce</code> set playerbots' <code>RTSC force enabled</code> flag, which makes a move
+    run to completion (remembered destination, re-issued at <code>MOVEMENT_FORCED</code>) instead
+    of being abandoned as soon as something aggroes; <code>unforce</code> also aborts a move in
+    progress. Note the marker position itself can still only reach a bot through a real ground cast
+    of spell 30758 from the master's client.</td>
   </tr>
   <tr>
     <td><code>ERR</code></td>

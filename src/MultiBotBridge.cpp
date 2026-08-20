@@ -4051,12 +4051,12 @@ std::string NormalizeRTSCCommand(std::string const& command)
         return "";
 
     // "enable" stands in for playerbots' bare `rtsc` (which trains the master's aedm spell);
-    // "persist", "here", "lock" and "unlock" are bridge-side only and never reach RTSCAction as
-    // written.
+    // "persist", "here", "lock", "unlock", "force" and "unforce" are bridge-side only and never
+    // reach RTSCAction as written.
     static std::set<std::string> const bare =
     {
         "enable", "select", "cancel", "toggle", "reset", "move", "last", "show", "persist", "here",
-        "lock", "unlock"
+        "lock", "unlock", "force", "unforce"
     };
 
     std::string normalized;
@@ -4078,7 +4078,7 @@ std::string NormalizeRTSCCommand(std::string const& command)
     // The bridge-side sub-commands act before (and instead of) the chat filter, so a selector on
     // them would silently apply to bots the filter would have dropped. Use the scope instead.
     if (normalized == "persist" || normalized == "here" || normalized == "lock" ||
-        normalized == "unlock")
+        normalized == "unlock" || normalized == "force" || normalized == "unforce")
         return "";
 
     return selector + " " + normalized;
@@ -4141,6 +4141,45 @@ bool ApplyNativeRTSCSelectionLock(PlayerbotAI* botAI, bool locked)
     return true;
 }
 
+// "Force move": upstream's RTSC move is a single spline stamped MOVEMENT_NORMAL and nothing
+// re-issues it, so the first combat chase (MOVEMENT_COMBAT) takes the motion master over on the
+// next AI tick - which is why bots abandon a move as soon as anything aggroes, and why the manual
+// workaround is `co +passive` before and `-passive` after. While this flag is set, MoveToSpell
+// remembers the destination and moves at MOVEMENT_FORCED, and playerbots' "rtsc forced move"
+// action re-issues it until the bot arrives; the bot still fights back on the way, only its
+// movement is monopolised. Clearing the flag also clears the destination, which is the abort.
+// Bridge-side only: there is no RTSCAction sub-command for it. Needs the matching
+// RTSCForceEnabledValue in mod-playerbots - on a worldserver without it the value does not exist,
+// so this reports 0 executed and the addon falls back to telling the user.
+bool ApplyNativeRTSCForce(PlayerbotAI* botAI, bool enabled)
+{
+    if (!botAI)
+        return false;
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return false;
+
+    Value<bool>* const force = context->GetValue<bool>("RTSC force enabled");
+    if (!force)
+        return false;
+
+    force->Set(enabled);
+
+    if (enabled)
+    {
+        // The action lives on the "rtsc" strategy, which is opt-in and off by default. Arm it on
+        // both engines so the escort survives the bot entering combat - that is the whole point -
+        // without the user having to send `co +rtsc` / `nc +rtsc` by hand first.
+        botAI->ChangeStrategy("+rtsc", BOT_STATE_COMBAT);
+        botAI->ChangeStrategy("+rtsc", BOT_STATE_NON_COMBAT);
+    }
+    else if (Value<WorldPosition>* const destination = context->GetValue<WorldPosition>("RTSC forced destination"))
+        destination->Reset();
+
+    return true;
+}
+
 void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
@@ -4175,6 +4214,14 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
             if (sub == "lock" || sub == "unlock")
             {
                 if (ApplyNativeRTSCSelectionLock(botAI, sub == "lock"))
+                    ++executed;
+
+                continue;
+            }
+
+            if (sub == "force" || sub == "unforce")
+            {
+                if (ApplyNativeRTSCForce(botAI, sub == "force"))
                     ++executed;
 
                 continue;
