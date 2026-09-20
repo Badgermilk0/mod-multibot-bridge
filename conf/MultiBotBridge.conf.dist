@@ -8,15 +8,34 @@
 # worldserver.conf they fall back to Logger.root, which is enough to see them on the console;
 # add one to route them elsewhere, e.g.:
 #   Logger.multibotbridge = 4,Console Server
+# The one-line "mod-multibot-bridge loaded" banner is NOT gated on this - it always goes to
+# server.loading, so "is the module in this build?" has an answer without turning logs on.
 # 1 = enabled
 # 0 = disabled
 MultiBotBridge.EnableConsoleLogs = 0
 
 # Per-player request throttle (token bucket). The addon paces its own sends, but the
-# server must not trust the client: some GET~ requests run synchronous DB queries on the
-# world thread. Messages beyond the budget are dropped silently; the addon's request
-# watchdog reports the timeout.
-# RequestsPerSecond: sustained requests per second per player (0 = throttle disabled).
-# RequestBurst: extra burst capacity (bootstrap / opening a full bot panel is ~10 requests).
+# server must not trust the client: some GET~ requests run synchronous DB queries or
+# playerbots grid searches on the world thread. Messages beyond the budget are dropped and
+# answered with ERR~THROTTLED (at most one such reply per second per player); the addon's
+# request watchdog reports the timeout either way.
+#
+# Requests are charged by what answering them costs, not one token each:
+#   1 token  - everything not listed below
+#   2 tokens - GET~GBANK, RUN~ITEM_ACTION, GET~GAMEOBJECTS for a single bot
+#   4 tokens - GET~GAMEOBJECTS for the whole group (five playerbots grid searches per bot)
+# A cost larger than RequestBurst is clamped to it, so a small burst makes the bridge slow
+# rather than making an expensive verb unanswerable.
+#
+# RequestsPerSecond: sustained tokens per second per player (0 = throttle disabled).
+# RequestBurst: bucket size (bootstrap / opening a full bot panel is ~10 requests).
 MultiBotBridge.RequestsPerSecond = 10
 MultiBotBridge.RequestBurst = 20
+
+# Safety valve for very large bot pools: the most bots one request will be answered for.
+# Group-wide verbs (GET~ROSTER, GET~STATES, GET~QUESTS with no bot name, ...) answer per bot,
+# and RUN~ commands with scope ALL apply per bot, so this also caps how many bots such a
+# command reaches. Leave at 0 unless a single player can hold more bots than the worldserver
+# is comfortable serving in one tick.
+# 0 = unlimited (default, and the historic behaviour)
+MultiBotBridge.MaxBotsPerRequest = 0

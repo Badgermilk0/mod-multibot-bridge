@@ -10,6 +10,7 @@
 #include "GuildMgr.h"
 #include "Item.h"
 #include "ItemPackets.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
@@ -65,6 +66,11 @@ struct BridgeConfigData
     bool consoleLogs = false;
     uint32 requestsPerSecond = 10; // 0 disables the per-player request throttle.
     uint32 requestBurst = 20;
+    uint32 maxBotsPerRequest = 0; // 0 = unlimited; caps how many bots one fan-out request serves.
+
+    // Bumped by every config load. Caches derived from config (the talent-spec catalog) key
+    // themselves on it, so `.reload config` invalidates them without a separate hook.
+    uint32 generation = 0;
 };
 
 // Read once per config load instead of per addon packet. BridgeConsoleLogsEnabled() runs on
@@ -82,6 +88,8 @@ void LoadBridgeConfig()
     config.consoleLogs = sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", false);
     config.requestsPerSecond = sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestsPerSecond", 10);
     config.requestBurst = sConfigMgr->GetOption<uint32>("MultiBotBridge.RequestBurst", 20);
+    config.maxBotsPerRequest = sConfigMgr->GetOption<uint32>("MultiBotBridge.MaxBotsPerRequest", 0);
+    ++config.generation;
 }
 
 bool BridgeConsoleLogsEnabled()
@@ -99,9 +107,20 @@ uint32 BridgeRequestBurst()
     return BridgeConfig().requestBurst;
 }
 
+uint32 BridgeMaxBotsPerRequest()
+{
+    return BridgeConfig().maxBotsPerRequest;
+}
+
+uint32 BridgeConfigGeneration()
+{
+    return BridgeConfig().generation;
+}
+
 Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
+std::vector<ObjectGuid> GetBridgeVisibleBotGuids(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -125,7 +144,10 @@ std::string Trim(std::string const& value)
 
 std::string ToUpper(std::string value)
 {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::toupper(c); });
+    // static_cast, like the tolower siblings below: std::toupper returns int, and letting the
+    // lambda deduce int made every ToUpper call narrow inside std::transform.
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return value;
 }
 
@@ -150,14 +172,45 @@ bool TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& p
     // Require our own prefix. The addon always sends "MBOT\t<opcode>...", so refusing anything else
     // keeps the bridge from inspecting (and, via OnPlayerCanUseChat, potentially suppressing) other
     // addons' LANG_ADDON traffic that merely happens to share an opcode word.
-    if (payload.rfind(kAddonPrefix, 0) != 0)
+    //
+    // The tab matters: the client builds an addon message as `<prefix> \t <message>`, so a plain
+    // prefix test also matched every *longer* prefix that starts with ours (an addon registering
+    // "MBOTX" or "MBOTLITE"). Those messages were then consumed here and - because TryHandle
+    // returns true for anything carrying our prefix - suppressed before reaching their own addon.
+    std::size_t const prefixLength = std::char_traits<char>::length(kAddonPrefix);
+    if (payload.size() <= prefixLength || payload.compare(0, prefixLength, kAddonPrefix) != 0 ||
+        payload[prefixLength] != '\t')
         return false;
 
-    payload.erase(0, std::char_traits<char>::length(kAddonPrefix));
-    while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
+    payload.erase(0, prefixLength);
+    while (!payload.empty() && (payload.front() == '\t' || payload.front() == ' '))
         payload.erase(payload.begin());
 
     return !payload.empty();
+}
+
+// A legal 3.3.5a character name can never contain a protocol delimiter, which is why several
+// streams (INV_*, SB_*, STATE - see the framing note in the README) echo the bot name unencoded
+// and the addon reads it raw. A *requested* name, though, comes straight off the client and need
+// not be legal: without this, a crafted GET~INVENTORY~a~b~c would put an extra separator into the
+// echoed INV_BEGIN and desynchronise the addon's field parsing. Strip the four framing characters
+// at the request boundary - a no-op for every name that can actually exist.
+std::string SanitizeWireName(std::string const& value)
+{
+    std::string out;
+    out.reserve(value.size());
+
+    for (char const c : value)
+        if (c != kFieldSeparator && c != '%' && c != '\r' && c != '\n')
+            out.push_back(c);
+
+    return out;
+}
+
+// Every bot-name field arriving from the addon goes through here.
+std::string TrimBotName(std::string const& value)
+{
+    return SanitizeWireName(Trim(value));
 }
 
 std::string UrlEncodeField(std::string const& value)
@@ -578,16 +631,19 @@ std::string BuildBotDetailPayload(Player* bot)
 
 SkillLineAbilityEntry const* GetSkillLineAbilityForSpell(uint32 spellId)
 {
+    // Built once from the DBC and never invalidated (the store is read-only after startup).
+    // Every spellbook / recipe request hits this per spell, so the index is a hash map.
     static bool initialized = false;
-    static std::map<uint32, SkillLineAbilityEntry const*> spellSkillLines;
+    static std::unordered_map<uint32, SkillLineAbilityEntry const*> spellSkillLines;
 
     if (!initialized)
     {
         initialized = true;
+        spellSkillLines.reserve(sSkillLineAbilityStore.GetNumRows());
         for (uint32 index = 0; index < sSkillLineAbilityStore.GetNumRows(); ++index)
             if (SkillLineAbilityEntry const* const skillLine = sSkillLineAbilityStore.LookupEntry(index))
                 if (skillLine->Spell)
-                    spellSkillLines[skillLine->Spell] = skillLine;
+                    spellSkillLines[skillLine->Spell] = skillLine; // last row wins, as before
     }
 
     auto const it = spellSkillLines.find(spellId);
@@ -799,7 +855,65 @@ uint8 ArenaTeamTypeToPayloadIndex(uint8 type)
     }
 }
 
-PvpStatsData BuildPvpStatsData(Player* bot)
+// Arena teams have no in-memory lookup by member, so they come from the DB. One query for the
+// whole batch rather than one per bot: a group-wide GET~PVP_STATS used to issue a synchronous
+// CharacterDatabase query per visible bot inside a single chat handler, so a 25-man raid of bots
+// meant 25 round trips on the world thread for one panel refresh.
+using BotArenaTeams = std::array<PvpStatsData::TeamData, 3>;
+using BotArenaTeamMap = std::unordered_map<ObjectGuid::LowType, BotArenaTeams>;
+
+BotArenaTeamMap LoadArenaTeamsForBots(std::vector<Player*> const& bots)
+{
+    BotArenaTeamMap teams;
+    if (bots.empty())
+        return teams;
+
+    std::ostringstream guidList;
+    bool first = true;
+    for (Player* const bot : bots)
+    {
+        if (!bot)
+            continue;
+
+        if (!first)
+            guidList << ',';
+        first = false;
+        guidList << bot->GetGUID().GetCounter();
+    }
+
+    if (first)
+        return teams;
+
+    // The guid list is built from live ObjectGuid counters, never from addon input.
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT atm.guid, at.type, at.name, at.rating "
+        "FROM arena_team_member atm "
+        "INNER JOIN arena_team at ON at.arenaTeamId = atm.arenaTeamId "
+        "WHERE atm.guid IN ({})",
+        guidList.str());
+
+    if (!result)
+        return teams;
+
+    do
+    {
+        Field* const fields = result->Fetch();
+        ObjectGuid::LowType const guid = fields[0].Get<uint32>();
+        uint8 const index = ArenaTeamTypeToPayloadIndex(fields[1].Get<uint8>());
+
+        BotArenaTeams& botTeams = teams[guid];
+        if (index >= botTeams.size())
+            continue;
+
+        botTeams[index].name = fields[2].Get<std::string>();
+        botTeams[index].rating = fields[3].Get<uint32>();
+    }
+    while (result->NextRow());
+
+    return teams;
+}
+
+PvpStatsData BuildPvpStatsData(Player* bot, BotArenaTeams const* teams)
 {
     PvpStatsData data;
     if (!bot)
@@ -809,38 +923,15 @@ PvpStatsData BuildPvpStatsData(Player* bot)
     data.arenaPoints = bot->GetArenaPoints();
     data.honorPoints = bot->GetHonorPoints();
 
-    // Known cost: one synchronous CharacterDatabase query per bot. A group-wide GET~PVP_STATS fans
-    // this out across every visible bot in a single chat handler. Acceptable because it is a
-    // user-triggered panel refresh (not per-frame); revisit (batch/async) only if it ever shows up.
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT at.type, at.name, at.rating "
-        "FROM arena_team_member atm "
-        "INNER JOIN arena_team at ON at.arenaTeamId = atm.arenaTeamId "
-        "WHERE atm.guid = {}",
-        bot->GetGUID().GetCounter());
-
-    if (!result)
-        return data;
-
-    do
-    {
-        Field* const fields = result->Fetch();
-        uint8 const type = fields[0].Get<uint8>();
-        uint8 const index = ArenaTeamTypeToPayloadIndex(type);
-        if (index >= data.teams.size())
-            continue;
-
-        data.teams[index].name = fields[1].Get<std::string>();
-        data.teams[index].rating = fields[2].Get<uint32>();
-    }
-    while (result->NextRow());
+    if (teams)
+        data.teams = *teams;
 
     return data;
 }
 
-std::string BuildPvpStatsPayload(Player* bot)
+std::string BuildPvpStatsPayload(Player* bot, BotArenaTeams const* teams)
 {
-    PvpStatsData const data = BuildPvpStatsData(bot);
+    PvpStatsData const data = BuildPvpStatsData(bot, teams);
     if (data.name.empty())
         return "";
 
@@ -932,13 +1023,11 @@ std::string GetPremadeSpecLink(uint8 classId, uint32 specIndex, uint32 botLevel)
     return "";
 }
 
-std::vector<TalentSpecEntryData> BuildTalentSpecEntries(Player* bot)
+std::vector<TalentSpecEntryData> BuildTalentSpecEntriesFor(uint8 classId, uint32 botLevel)
 {
     std::vector<TalentSpecEntryData> entries;
-    if (!bot)
+    if (!classId)
         return entries;
-
-    uint8 const classId = static_cast<uint8>(bot->getClass());
 
     for (uint32 specIndex = 0; specIndex <= 30; ++specIndex)
     {
@@ -953,7 +1042,7 @@ std::vector<TalentSpecEntryData> BuildTalentSpecEntries(Player* bot)
         entry.index = specIndex;
         entry.name = specName;
 
-        std::string const link = GetPremadeSpecLink(classId, specIndex, bot->GetLevel());
+        std::string const link = GetPremadeSpecLink(classId, specIndex, botLevel);
         if (!link.empty())
             entry.build = BuildTalentLinkPointSummary(link);
 
@@ -963,9 +1052,44 @@ std::vector<TalentSpecEntryData> BuildTalentSpecEntries(Player* bot)
     return entries;
 }
 
+// The catalog is pure config: 31 PremadeSpecName probes per request plus up to six
+// PremadeSpecLink probes per spec that exists, all through sConfigMgr (a mutex, a map lookup and
+// a string build each). It cannot change between config loads, so cache it per class and level
+// and let BridgeConfigGeneration - bumped by OnAfterConfigLoad, i.e. by `.reload config` - be the
+// invalidation. Levels come from live bots, so the map stays at most one entry per class/level
+// actually asked about.
+std::vector<TalentSpecEntryData> const& GetTalentSpecEntries(uint8 classId, uint32 botLevel)
+{
+    static uint32 cachedGeneration = 0;
+    static std::map<std::pair<uint8, uint32>, std::vector<TalentSpecEntryData>> cache;
+
+    uint32 const generation = BridgeConfigGeneration();
+    if (generation != cachedGeneration)
+    {
+        cachedGeneration = generation;
+        cache.clear();
+    }
+
+    std::pair<uint8, uint32> const key(classId, botLevel);
+    auto const it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+
+    return cache.emplace(key, BuildTalentSpecEntriesFor(classId, botLevel)).first->second;
+}
+
+std::vector<TalentSpecEntryData> const& BuildTalentSpecEntries(Player* bot)
+{
+    static std::vector<TalentSpecEntryData> const empty;
+    if (!bot)
+        return empty;
+
+    return GetTalentSpecEntries(static_cast<uint8>(bot->getClass()), bot->GetLevel());
+}
+
 void SendTalentSpecListPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
 {
-    std::string const requestedBotName = Trim(botNameValue);
+    std::string const requestedBotName = TrimBotName(botNameValue);
     std::string const token = Trim(tokenValue);
     Player* const bot = FindBotByName(requester, requestedBotName);
 
@@ -976,7 +1100,7 @@ void SendTalentSpecListPackets(Player* requester, ChatMsg replyType, std::string
 
     if (bot)
     {
-        std::vector<TalentSpecEntryData> const specs = BuildTalentSpecEntries(bot);
+        std::vector<TalentSpecEntryData> const& specs = BuildTalentSpecEntries(bot);
         for (TalentSpecEntryData const& spec : specs)
         {
             std::ostringstream payload;
@@ -1066,7 +1190,7 @@ uint32 FindGlyphItemId(uint32 glyphId, uint32 spellId)
 
 void SendGlyphPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
 {
-    std::string const requestedBotName = Trim(botNameValue);
+    std::string const requestedBotName = TrimBotName(botNameValue);
     std::string const token = Trim(tokenValue);
     Player* const bot = FindBotByName(requester, requestedBotName);
 
@@ -1166,47 +1290,20 @@ std::vector<QuestEntryData> BuildQuestEntries(Player* bot, std::string const& mo
             AppendQuestEntry(entries, seen, questId, false, mode);
     }
 
-    if (!entries.empty())
-    {
-        SortQuestEntries(entries);
-        return entries;
-    }
-
-    // Fallback DB uniquement si le quest log runtime est vide.
-    // Certains forks stockent les quêtes actives avec un statut DB brut 0/1/3,
-    // qui ne correspond pas toujours directement à l'enum runtime QuestStatus.
+    // No character_queststatus fallback: the runtime quest log IS that table.
     //
-    // Known cost (same shape as BuildPvpStatsData): one synchronous CharacterDatabase query on
-    // the world thread. A group-wide GET~QUESTS (empty bot name - the addon's "isGroup" path)
-    // fans this out across every visible bot whose runtime quest log came back empty.
-    // Acceptable because it is a user-triggered panel refresh, bounded by the request throttle,
-    // and only reached on the empty-log fallback; revisit (batch/async) only if it shows up.
-
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT quest, status FROM character_queststatus WHERE guid = {}",
-        bot->GetGUID().GetCounter());
-
-    if (!result)
-        return entries;
-
-    do
-    {
-        Field* const fields = result->Fetch();
-        uint32 const questId = fields[0].Get<uint32>();
-        uint8 const status = fields[1].Get<uint8>();
-
-        bool completed = false;
-        if (status == static_cast<uint8>(QUEST_STATUS_COMPLETE) || status == 1)
-            completed = true;
-        else if (status == static_cast<uint8>(QUEST_STATUS_INCOMPLETE) || status == static_cast<uint8>(QUEST_STATUS_FAILED) || status == 0 || status == 3)
-            completed = false;
-        else
-            continue;
-
-        AppendQuestEntry(entries, seen, questId, completed, mode);
-    }
-    while (result->NextRow());
-
+    // Player::_LoadQuestStatus reads every character_queststatus row at login and writes one
+    // quest-log slot per row (skipping only QUEST_STATUS_NONE and anything past
+    // MAX_QUEST_LOG_SIZE), and GetBridgeVisibleBots only ever yields bots that are logged in -
+    // so for any bot the bridge can see, the loop above has already seen everything the table
+    // holds. The old fallback therefore never added a real quest, but it did two harmful things:
+    //
+    //   * it reported phantom quests. It mapped raw status 0 to "incomplete", and 0 is
+    //     QUEST_STATUS_NONE - an abandoned/never-accepted row the core deliberately keeps out of
+    //     the log. A bot with no quests at all but stale rows listed them all as in progress.
+    //   * it cost one synchronous CharacterDatabase query per bot on the world thread, and it
+    //     fired exactly when the log was empty - i.e. for *every* questless bot on a group-wide
+    //     GET~QUESTS (the addon's "isGroup" path sends an empty bot name).
     SortQuestEntries(entries);
     return entries;
 }
@@ -1250,7 +1347,7 @@ void SendQuestPacketsForBot(Player* requester, ChatMsg replyType, Player* bot, s
 void SendQuestPackets(Player* player, ChatMsg replyType, std::string const& modeValue, std::string const& botNameValue, std::string const& tokenValue)
 {
     std::string const mode = NormalizeQuestMode(modeValue);
-    std::string const botName = Trim(botNameValue);
+    std::string const botName = TrimBotName(botNameValue);
     std::string const token = Trim(tokenValue);
 
     if (!botName.empty())
@@ -1332,7 +1429,7 @@ void SendGameObjectPacketsForBot(Player* requester, ChatMsg replyType, Player* b
 
 void SendGameObjectPackets(Player* player, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
 {
-    std::string const botName = Trim(botNameValue);
+    std::string const botName = TrimBotName(botNameValue);
     std::string const token = Trim(tokenValue);
 
     if (!botName.empty())
@@ -1435,6 +1532,22 @@ std::map<uint32, uint32> BuildBotInventoryItemCounts(Player* bot)
     }
 
     return counts;
+}
+
+// Sort key for the colour names GetRecipeDifficulty returns: hardest (and most likely to raise
+// the skill) first, unknown last.
+uint32 GetRecipeDifficultyRank(std::string const& difficulty)
+{
+    if (difficulty == "orange")
+        return 0;
+    if (difficulty == "yellow")
+        return 1;
+    if (difficulty == "green")
+        return 2;
+    if (difficulty == "gray")
+        return 3;
+
+    return 4;
 }
 
 std::string GetRecipeDifficulty(Player* bot, SkillLineAbilityEntry const* skillLine)
@@ -1739,10 +1852,17 @@ std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot,
         entries.push_back(entry);
     }
 
+    // The addon renders this list in the order it arrives and uses `difficulty` only to colour
+    // the row, so the server's sort *is* the UI order. Grouping by difficulty is intended; the
+    // comparison used to be a plain string compare on the colour name, which orders them
+    // gray < green < orange < yellow - trivial recipes first and the ones actually worth crafting
+    // buried in the middle. Rank them properly instead, hardest first, name as the tie-break.
     std::sort(entries.begin(), entries.end(), [](ProfessionRecipeEntryData const& left, ProfessionRecipeEntryData const& right)
     {
-        if (left.difficulty != right.difficulty)
-            return left.difficulty < right.difficulty;
+        uint32 const leftRank = GetRecipeDifficultyRank(left.difficulty);
+        uint32 const rightRank = GetRecipeDifficultyRank(right.difficulty);
+        if (leftRank != rightRank)
+            return leftRank < rightRank;
         if (left.spellName != right.spellName)
             return left.spellName < right.spellName;
         return left.spellId < right.spellId;
@@ -1827,7 +1947,7 @@ uint32 BuildXpPct(Player* bot)
     if (!nextLevelXp)
         return 0;
 
-    return std::min<uint32>(100, (bot->GetUInt32Value(PLAYER_XP) * 100u) / nextLevelXp);
+    return GetPct(bot->GetUInt32Value(PLAYER_XP), nextLevelXp);
 }
 
 StatsData BuildStatsData(Player* bot)
@@ -1877,7 +1997,7 @@ std::string BuildStatsPayload(Player* bot)
 
 void SendInventorySnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = trimmedBotName + std::string(1, kFieldSeparator) + requestToken;
@@ -1950,6 +2070,17 @@ PlayerbotAI* GetBotAI(Player* bot)
     return sPlayerbotsMgr.GetPlayerbotAI(bot);
 }
 
+// "nearest npcs" is NearestNpcsValue, whose AcceptUnit is just `!unit->IsPlayer()` - it returns
+// every non-player unit inside sightDistance, corpses included. Without this a bot happily banked
+// at, and bought from, a *dead* banker or vendor: the NPC flags survive death, and neither
+// Player::CanBankItem nor BuyItemFromVendorSlot re-checks the NPC the way the real
+// GetNPCIfCanInteractWith path does. Range is deliberately left at playerbots' sight distance,
+// which is what every other bridge "is there one near the bot" test uses.
+bool IsUsableServiceNpc(Player* bot, Unit* unit)
+{
+    return unit && unit->IsInWorld() && unit->IsAlive() && !unit->IsHostileTo(bot);
+}
+
 Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag)
 {
     PlayerbotAI* const botAI = GetBotAI(bot);
@@ -1965,7 +2096,7 @@ Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag)
     for (ObjectGuid const guid : npcs)
     {
         Unit* const unit = botAI->GetUnit(guid);
-        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(npcFlag)))
+        if (!unit || !IsUsableServiceNpc(bot, unit) || !unit->HasNpcFlag(static_cast<NPCFlags>(npcFlag)))
             continue;
 
         if (Creature* const creature = unit->ToCreature())
@@ -1994,7 +2125,7 @@ Creature* FindNearbyVendorSellingItem(Player* bot, uint32 itemId, uint32& vendor
     for (ObjectGuid const guid : npcs)
     {
         Unit* const unit = botAI->GetUnit(guid);
-        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(UNIT_NPC_FLAG_VENDOR)))
+        if (!unit || !IsUsableServiceNpc(bot, unit) || !unit->HasNpcFlag(static_cast<NPCFlags>(UNIT_NPC_FLAG_VENDOR)))
             continue;
 
         Creature* const creature = unit->ToCreature();
@@ -2120,60 +2251,85 @@ void AddItemEntryToSnapshot(std::map<uint32, uint32>& itemCounts, std::map<uint3
     itemTemplates[itemId] = proto;
 }
 
-int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* bot, uint8 tabId)
+// Per-tab withdraw budget, indexed by tab id. Guild::_GetMemberRemainingSlots and
+// Guild::GetBankTab are private in core, so the rights have to come from the DB - but they come
+// for the whole rank in one query. The previous shape queried a single tab at a time, which cost
+// GUILD_BANK_MAX_TABS round trips per GET~GBANK and, worse, one round trip per matching row
+// inside the withdraw loop (a guild bank holding twenty stacks of an item meant twenty queries).
+using GuildBankTabRemaining = std::array<int32, GUILD_BANK_MAX_TABS>;
+
+GuildBankTabRemaining LoadGuildBankWithdrawRemaining(Guild* guild, Player* bot)
 {
+    GuildBankTabRemaining remaining;
+    remaining.fill(0);
+
     if (!guild || !bot)
-        return 0;
+        return remaining;
 
     Guild::Member const* const member = guild->GetMember(bot->GetGUID());
     if (!member)
-        return 0;
+        return remaining;
 
     if (member->IsRank(GR_GUILDMASTER) || guild->GetLeaderGUID() == bot->GetGUID())
-        return std::numeric_limits<int32>::max();
-
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT gbright, SlotPerDay FROM guild_bank_right "
-        "WHERE guildid = {} AND TabId = {} AND rid = {}",
-        guild->GetId(), uint32(tabId), uint32(member->GetRankId()));
-
-    if (!result)
-        return 0;
-
-    Field* const fields = result->Fetch();
-    uint32 const rights = fields[0].Get<uint32>();
-    uint32 const slotsPerDay = fields[1].Get<uint32>();
-
-    if ((rights & GUILD_BANK_RIGHT_VIEW_TAB) == 0 || slotsPerDay == 0)
-        return 0;
-
-    if (slotsPerDay == uint32(GUILD_WITHDRAW_SLOT_UNLIMITED))
-        return std::numeric_limits<int32>::max();
-
-    int32 const used = member->GetBankWithdrawValue(tabId);
-    int64 const remaining = int64(slotsPerDay) - int64(used > 0 ? used : 0);
-    return remaining > 0 ? int32(std::min<int64>(remaining, std::numeric_limits<int32>::max())) : 0;
-}
-
-int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* bot)
-{
-    int32 bestRemaining = 0;
-    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
     {
-        int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, bot, tabId);
-        if (remaining == std::numeric_limits<int32>::max())
-            return remaining;
-
-        if (remaining > bestRemaining)
-            bestRemaining = remaining;
+        remaining.fill(std::numeric_limits<int32>::max());
+        return remaining;
     }
 
-    return bestRemaining;
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT TabId, gbright, SlotPerDay FROM guild_bank_right WHERE guildid = {} AND rid = {}",
+        guild->GetId(), uint32(member->GetRankId()));
+
+    if (!result)
+        return remaining;
+
+    do
+    {
+        Field* const fields = result->Fetch();
+        uint8 const tabId = fields[0].Get<uint8>();
+        if (tabId >= remaining.size())
+            continue;
+
+        uint32 const rights = fields[1].Get<uint32>();
+        uint32 const slotsPerDay = fields[2].Get<uint32>();
+
+        if ((rights & GUILD_BANK_RIGHT_VIEW_TAB) == 0 || slotsPerDay == 0)
+            continue;
+
+        if (slotsPerDay == uint32(GUILD_WITHDRAW_SLOT_UNLIMITED))
+        {
+            remaining[tabId] = std::numeric_limits<int32>::max();
+            continue;
+        }
+
+        int32 const used = member->GetBankWithdrawValue(tabId);
+        int64 const left = int64(slotsPerDay) - int64(used > 0 ? used : 0);
+        remaining[tabId] = left > 0 ? int32(std::min<int64>(left, std::numeric_limits<int32>::max())) : 0;
+    }
+    while (result->NextRow());
+
+    return remaining;
+}
+
+// The single number GBANK_RIGHTS reports: the best budget across all tabs, as before.
+int32 BestGuildBankWithdrawRemaining(GuildBankTabRemaining const& remaining)
+{
+    int32 best = 0;
+    for (int32 const tabRemaining : remaining)
+    {
+        if (tabRemaining == std::numeric_limits<int32>::max())
+            return tabRemaining;
+
+        if (tabRemaining > best)
+            best = tabRemaining;
+    }
+
+    return best;
 }
 
 void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
@@ -2229,7 +2385,7 @@ void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& bo
 
 void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
@@ -2261,7 +2417,7 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
         return;
     }
 
-    int32 const withdrawRemaining = GetGuildBankWithdrawRemaining(guild, bot);
+    int32 const withdrawRemaining = BestGuildBankWithdrawRemaining(LoadGuildBankWithdrawRemaining(guild, bot));
     SendAddonPacket(
         requester,
         replyType,
@@ -2274,19 +2430,18 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
     std::map<uint32, uint32> itemCounts;
     std::map<uint32, ItemTemplate const*> itemTemplates;
 
-    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+    // One query for every tab: the payload aggregates by item entry anyway, so per-tab queries
+    // only multiplied the round trips.
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT ii.itemEntry, ii.count "
+        "FROM guild_bank_item gbi "
+        "INNER JOIN item_instance ii ON ii.guid = gbi.item_guid "
+        "WHERE gbi.guildid = {} AND gbi.TabId < {} "
+        "ORDER BY gbi.TabId, gbi.SlotId",
+        guild->GetId(), uint32(GUILD_BANK_MAX_TABS));
+
+    if (result)
     {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT ii.itemEntry, ii.count "
-            "FROM guild_bank_item gbi "
-            "INNER JOIN item_instance ii ON ii.guid = gbi.item_guid "
-            "WHERE gbi.guildid = {} AND gbi.TabId = {} "
-            "ORDER BY gbi.SlotId",
-            guild->GetId(), uint32(tabId));
-
-        if (!result)
-            continue;
-
         do
         {
             Field* const fields = result->Fetch();
@@ -2309,7 +2464,7 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
 
 void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = trimmedBotName + std::string(1, kFieldSeparator) + requestToken;
@@ -2334,7 +2489,7 @@ void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string con
 
 void SendBotSkillPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
@@ -2354,7 +2509,7 @@ void SendBotSkillPackets(Player* requester, ChatMsg replyType, std::string const
 
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
@@ -2383,7 +2538,7 @@ void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string cons
         49426  // Emblem of Frost
     }};
 
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
@@ -2533,7 +2688,7 @@ void SendTrainerErrorPacket(Player* requester, ChatMsg replyType, std::string co
 
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
@@ -2626,7 +2781,7 @@ void SendTrainerLearnResult(Player* requester, ChatMsg replyType, std::string co
 
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     std::string const token = Trim(requestToken);
     uint32 const expectedTrainerEntry = static_cast<uint32>(std::strtoul(Trim(trainerEntryValue).c_str(), nullptr, 10));
     std::string const requestedSpell = ToUpper(Trim(spellIdValue));
@@ -2699,7 +2854,7 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
 
 void SendProfessionRecipePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& skillIdValue, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     uint32 const skillId = static_cast<uint32>(std::strtoul(Trim(skillIdValue).c_str(), nullptr, 10));
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
@@ -2827,7 +2982,7 @@ std::vector<OutfitSetSnapshot> BuildOutfitSnapshots(Player* bot)
 
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
     std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + Trim(requestToken);
@@ -2891,21 +3046,34 @@ std::string SanitizeOutfitCommandSuffix(std::string suffix)
     return Trim(suffix);
 }
 
+// Order is load-bearing, so the entries come out in equipment-slot order rather than sorted.
+// ApplyBridgeNativeOutfitCommand equips them in the stored sequence and the *second* item of a
+// pair is what triggers the second-slot bumps: ring 1 -> ring 2, trinket 1 -> trinket 2, and
+// (with Titan's Grip) main hand -> off hand for a second two-hander. Collecting into a
+// std::set sorted the outfit by item id instead, so which weapon ended up in the off hand -
+// and which ring in slot 1 - came down to whichever entry id happened to be lower.
 std::vector<uint32> CollectCurrentEquippedOutfitEntries(Player* bot)
 {
-    std::set<uint32> uniqueEntries;
+    std::vector<uint32> entries;
+    if (!bot)
+        return entries;
 
-    if (bot)
+    std::set<uint32> seen;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
     {
-        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
-        {
-            Item const* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-            if (item && item->GetEntry())
-                uniqueEntries.insert(item->GetEntry());
-        }
+        Item const* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!item || !item->GetEntry())
+            continue;
+
+        // A duplicate entry cannot equip twice (the second pass finds the item already worn),
+        // so it is dropped - but only after the first occurrence has fixed the ordering.
+        if (!seen.insert(item->GetEntry()).second)
+            continue;
+
+        entries.push_back(item->GetEntry());
     }
 
-    return std::vector<uint32>(uniqueEntries.begin(), uniqueEntries.end());
+    return entries;
 }
 
 // Mutating the "outfit list" AI value only changes the bot's in-memory context. Playerbots'
@@ -3030,7 +3198,7 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
                 if (!pBag)
                     continue;
 
-                for (uint32 slot = 0; slot < pBag->GetBagSize(); ++slot)
+                for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
                 {
                     Item* const item = bot->GetItemByPos(bag, slot);
                     if (item && item->GetEntry() == itemEntry)
@@ -3104,7 +3272,9 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
             return true;
         };
 
-        if (parts.action == "REPLACE")
+        // Mirrors the guard in equipItemByEntry: both unequip and equip drive the bot's session
+        // handlers directly, so neither may assume the session is there.
+        if (parts.action == "REPLACE" && bot->GetSession())
         {
             for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
             {
@@ -3172,6 +3342,12 @@ bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& 
     return true;
 }
 
+// Upper bound on the "keep moving stacks until none are left" loops below. A bot can hold at most
+// 16 backpack + 4 x 36 bag + 28 bank + 7 x 36 bank-bag slots, so a real request tops out far below
+// this; anything higher means a stack that refuses to leave its slot, and the loop would otherwise
+// spin forever on the world thread.
+constexpr uint32 kMaxItemMovePasses = 512;
+
 uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
     if (!bot || !itemId)
@@ -3187,8 +3363,19 @@ uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCo
     }
 
     uint32 moved = 0;
+    uint32 passes = 0;
     while (Item* const item = FindBagItemByEntry(bot, itemId))
     {
+        // Every pass must consume one source stack, so the total number of passes can never
+        // exceed the slots that could hold them. The guard is not about the expected path: it
+        // is there so that any future core change where the store silently leaves the item in
+        // its bag slot degrades into a failed request instead of spinning the world thread.
+        if (++passes > kMaxItemMovePasses)
+        {
+            reason = "TOO_MANY_STACKS";
+            return moved;
+        }
+
         uint32 const stackCount = item->GetCount();
         ItemPosCountVec dest;
         InventoryResult const msg = bot->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false);
@@ -3227,8 +3414,15 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
     }
 
     uint32 moved = 0;
+    uint32 passes = 0;
     while (Item* const item = FindBankItemByEntry(bot, itemId))
     {
+        if (++passes > kMaxItemMovePasses)
+        {
+            reason = "TOO_MANY_STACKS";
+            return moved;
+        }
+
         uint32 const stackCount = item->GetCount();
         ItemPosCountVec dest;
         InventoryResult const msg = bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
@@ -3252,7 +3446,7 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
     return moved;
 }
 
-uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
+uint32 MoveMatchingBagItemsToGuildBank(Player* /*requester*/, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
 {
     if (!bot || !itemId)
     {
@@ -3297,11 +3491,18 @@ uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 it
     }
 
     uint32 moved = 0;
+    uint32 passes = 0;
     while (Item* const item = FindBagItemByEntry(bot, itemId))
     {
+        if (++passes > kMaxItemMovePasses)
+        {
+            reason = "TOO_MANY_STACKS";
+            return moved;
+        }
+
         uint32 const stackCount = item->GetCount();
-        uint32 const playerSlot = item->GetSlot();
-        uint32 const playerBag = item->GetBagSlot();
+        uint8 const playerSlot = item->GetSlot();
+        uint8 const playerBag = item->GetBagSlot();
         ObjectGuid const itemGuid = item->GetGUID();
 
         // Try each depositable tab until the item leaves the bag slot (tab 0 may be full
@@ -3367,7 +3568,11 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
         return 0;
     }
 
-    if (GetGuildBankWithdrawRemaining(guild, bot) == 0)
+    // Loaded once, before the row loop: the budget cannot change underneath us here, because
+    // Guild::SwapItemsWithInventory only debits it after this function has already decided the
+    // tab is usable, and the loop stops as soon as the request is satisfied.
+    GuildBankTabRemaining const tabRemaining = LoadGuildBankWithdrawRemaining(guild, bot);
+    if (BestGuildBankWithdrawRemaining(tabRemaining) == 0)
     {
         reason = "NO_GUILD_BANK_RIGHTS";
         return 0;
@@ -3404,7 +3609,7 @@ uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 reque
         uint32 const stackCount = fields[2].Get<uint32>();
         foundAny = true;
 
-        if (GetGuildBankTabWithdrawRemaining(guild, bot, tabId) == 0)
+        if (tabId >= tabRemaining.size() || tabRemaining[tabId] == 0)
             continue;
 
         foundWithdrawable = true;
@@ -3477,7 +3682,12 @@ uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, 
     static uint32 const kMaxBuyCount = 1000;
     uint32 const desired = requestedCount > 0 ? std::min<uint32>(requestedCount, kMaxBuyCount) : 1;
     uint32 bought = 0;
-    for (uint32 i = 0; i < desired; ++i)
+
+    // `bought < desired` is the real stop condition, not the attempt counter: one call to
+    // BuyItemFromVendorSlot with count 1 yields pProto->BuyCount items, not one. For anything
+    // sold in bundles (arrows, bullets, reagents) the old loop ran `desired` times regardless
+    // and delivered BuyCount times what the addon asked for.
+    for (uint32 attempt = 0; attempt < desired && bought < desired; ++attempt)
     {
         uint32 const price = uint32(std::floor(proto->BuyPrice * bot->GetReputationPriceDiscount(vendor)));
         if (price > 0 && bot->GetMoney() < price)
@@ -3503,7 +3713,7 @@ uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, 
 
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     std::string const token = Trim(requestToken);
     std::string const action = ToUpper(Trim(actionValue));
     uint32 const itemId = static_cast<uint32>(std::strtoul(Trim(itemIdValue).c_str(), nullptr, 10));
@@ -3551,7 +3761,7 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
 
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     std::string const token = Trim(requestToken);
     uint32 const skillId = static_cast<uint32>(std::strtoul(Trim(skillIdValue).c_str(), nullptr, 10));
     uint32 const spellId = static_cast<uint32>(std::strtoul(Trim(spellIdValue).c_str(), nullptr, 10));
@@ -3581,7 +3791,7 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
 // unconditionally (see its comment), so UPDATE and RESET are durable whatever the addon sends.
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& /*persistToken*/)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = TrimBotName(botName);
     std::string const token = Trim(requestToken);
     std::string const suffix = SanitizeOutfitCommandSuffix(UrlDecodeField(encodedSuffix));
     Player* const bot = FindBotByName(requester, trimmedBotName);
@@ -3851,8 +4061,12 @@ void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scop
 
     if (IsAllowedRTICommand(command) && (scope == "ALL" || scope == "GROUP" || scope == "BOT"))
     {
-        for (Player* const bot : GetBridgeVisibleBots(requester))
+        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
         {
+            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
+            if (!bot)
+                continue;
+
             if (!BotMatchesRTIScope(requester, bot, scope, target))
                 continue;
 
@@ -3882,8 +4096,12 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
 
     if (IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
-        for (Player* const bot : GetBridgeVisibleBots(requester))
+        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
         {
+            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
+            if (!bot)
+                continue;
+
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
@@ -3913,8 +4131,12 @@ void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const&
 
     if (IsAllowedPositionCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
-        for (Player* const bot : GetBridgeVisibleBots(requester))
+        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
         {
+            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
+            if (!bot)
+                continue;
+
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
@@ -3944,8 +4166,12 @@ void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& sco
 
     if (IsAllowedLootCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
     {
-        for (Player* const bot : GetBridgeVisibleBots(requester))
+        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
         {
+            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
+            if (!bot)
+                continue;
+
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
@@ -4210,8 +4436,12 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
         std::string sub;
         SplitRTSCCommand(command, selector, sub);
 
-        for (Player* const bot : GetBridgeVisibleBots(requester))
+        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
         {
+            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
+            if (!bot)
+                continue;
+
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
@@ -4282,7 +4512,7 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
 // chatless replacement for `rtsc show`, which answers with a whisper the addon must not parse.
 void SendRtscPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
 {
-    std::string const requestedBotName = Trim(botNameValue);
+    std::string const requestedBotName = TrimBotName(botNameValue);
     std::string const token = Trim(tokenValue);
 
     SendAddonPacket(requester, replyType, "RTSC_BEGIN", token);
@@ -4394,44 +4624,39 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
     player->SendDirectMessage(&data);
 }
 
+// 64-bit intermediate: `current * 100` overflows uint32 once current passes ~42.9M, which is
+// unreachable for health but not for XP on a server with raised rates or an extended level cap.
 uint32 GetPct(uint32 current, uint32 max)
 {
     if (!max)
         return 0;
 
-    return static_cast<uint32>((current * 100u) / max);
+    uint64 const pct = (static_cast<uint64>(current) * 100u) / max;
+    return static_cast<uint32>(std::min<uint64>(pct, 100u));
 }
 
-bool IsBotInRequesterGroup(Player* requester, Player* bot)
+// Same predicate as before, only evaluated cheapest-first. This runs once per *random bot logged
+// in on the whole server* for every bridge request, and the two RandomPlayerbotMgr tests are far
+// from free: IsRandomBot does a character-cache lookup plus a random-account-list scan, and
+// IsAddclassBot probes 18 cache sets and can fall through to a character-cache + account-type
+// lookup. Almost every bot in that walk belongs to some other player, so the ownership test - a
+// group compare, then one PlayerbotsMgr map lookup - has to come first and reject them before
+// either of those runs.
+bool CanExposeRandomHolderBot(Player* requester, Player* bot, Group const* requesterGroup)
 {
     if (!requester || !bot)
         return false;
 
-    Group* const group = requester->GetGroup();
-    return group && bot->GetGroup() == group;
-}
-
-bool IsBotMasteredByRequester(Player* requester, Player* bot)
-{
-    if (!requester || !bot)
-        return false;
+    bool const inRequesterGroup = requesterGroup && bot->GetGroup() == requesterGroup;
 
     PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
-    return botAI && botAI->GetMaster() == requester;
-}
-
-bool CanExposeRandomHolderBot(Player* requester, Player* bot)
-{
-    if (!requester || !bot)
+    if (!botAI)
         return false;
 
-    if (!sPlayerbotsMgr.GetPlayerbotAI(bot))
+    if (!inRequesterGroup && botAI->GetMaster() != requester)
         return false;
 
-    if (!sRandomPlayerbotMgr.IsRandomBot(bot) && !sRandomPlayerbotMgr.IsAddclassBot(bot))
-        return false;
-
-    return IsBotMasteredByRequester(requester, bot) || IsBotInRequesterGroup(requester, bot);
+    return sRandomPlayerbotMgr.IsRandomBot(bot) || sRandomPlayerbotMgr.IsAddclassBot(bot);
 }
 
 // Walks the requester's own bots plus every visible random/addclass bot, deduped by GUID,
@@ -4459,30 +4684,54 @@ void ForEachBridgeVisibleBot(Player* player, Handler handler)
             if (!visit(it->second))
                 return;
 
+    Group const* const requesterGroup = player->GetGroup();
     for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
     {
         Player* const bot = it->second;
-        if (CanExposeRandomHolderBot(player, bot) && !visit(bot))
+        if (CanExposeRandomHolderBot(player, bot, requesterGroup) && !visit(bot))
             return;
     }
 }
 
+// MultiBotBridge.MaxBotsPerRequest is an opt-in safety valve for very large bot pools: a
+// group-wide verb answers per bot (GET~GAMEOBJECTS costs five playerbots grid searches each),
+// and this bounds the worst case an admin can be exposed to. 0 (the default) keeps the historic
+// behaviour of serving every visible bot.
 std::vector<Player*> GetBridgeVisibleBots(Player* player)
 {
     std::vector<Player*> bots;
+    uint32 const limit = BridgeMaxBotsPerRequest();
 
-    ForEachBridgeVisibleBot(player, [&bots](Player* bot)
+    ForEachBridgeVisibleBot(player, [&bots, limit](Player* bot)
     {
         bots.push_back(bot);
-        return true;
+        return !limit || bots.size() < limit;
     });
 
     return bots;
 }
 
+// GUID snapshot for the RUN~ verbs. Those loops dispatch into playerbots between iterations, so
+// holding raw Player* across them is only safe for as long as no whitelisted command can remove a
+// bot - true today (co/nc/ll/rti/rtsc all keep the bot in world), one whitelist entry away from
+// being false. Re-resolving per step costs one ObjectAccessor lookup and removes the class of bug.
+std::vector<ObjectGuid> GetBridgeVisibleBotGuids(Player* player)
+{
+    std::vector<ObjectGuid> guids;
+    uint32 const limit = BridgeMaxBotsPerRequest();
+
+    ForEachBridgeVisibleBot(player, [&guids, limit](Player* bot)
+    {
+        guids.push_back(bot->GetGUID());
+        return !limit || guids.size() < limit;
+    });
+
+    return guids;
+}
+
 Player* FindBotByName(Player* player, std::string const& botName)
 {
-    std::string const wantedName = Trim(botName);
+    std::string const wantedName = TrimBotName(botName);
     if (wantedName.empty())
         return nullptr;
 
@@ -4596,14 +4845,20 @@ std::string BuildPvpStatsPayload(Player* player, std::string const& botName)
     if (!bot)
         return "";
 
-    return BuildPvpStatsPayload(bot);
+    BotArenaTeamMap const teams = LoadArenaTeamsForBots({bot});
+    auto const it = teams.find(bot->GetGUID().GetCounter());
+    return BuildPvpStatsPayload(bot, it != teams.end() ? &it->second : nullptr);
 }
 
 void SendPvpStatsPackets(Player* player, ChatMsg replyType)
 {
-    for (Player* const bot : GetBridgeVisibleBots(player))
+    std::vector<Player*> const bots = GetBridgeVisibleBots(player);
+    BotArenaTeamMap const teams = LoadArenaTeamsForBots(bots);
+
+    for (Player* const bot : bots)
     {
-        std::string const payload = BuildPvpStatsPayload(bot);
+        auto const it = teams.find(bot->GetGUID().GetCounter());
+        std::string const payload = BuildPvpStatsPayload(bot, it != teams.end() ? &it->second : nullptr);
         if (!payload.empty())
             SendAddonPacket(player, replyType, "PVP_STATS", payload);
     }
@@ -4613,7 +4868,7 @@ std::string BuildStatePayload(Player* player, std::string const& botName)
 {
     Player* const bot = FindBotByName(player, botName);
     if (!bot)
-        return Trim(botName) + std::string(1, kFieldSeparator) + kFieldSeparator;
+        return TrimBotName(botName) + std::string(1, kFieldSeparator) + kFieldSeparator;
 
     PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
     if (!botAI)
@@ -4668,12 +4923,59 @@ void SendStatsPackets(Player* player, ChatMsg replyType)
     }
 }
 
+// How many throttle tokens a request costs. Everything is 1 except the few verbs whose answer is
+// "per visible bot, times something genuinely expensive" - there, one addon message can otherwise
+// buy a lot of world-thread time, and a flat budget prices it the same as a PING.
+uint32 GetRequestCost(std::string const& opcode, std::string const& payload)
+{
+    std::string const verb = ToUpper(Trim(opcode));
+
+    if (verb == "RUN")
+    {
+        // ITEM_ACTION covers the bank/guild-bank move loops and the vendor buy loop.
+        if (ToUpper(Trim(SplitOnce(payload, kFieldSeparator).first)) == "ITEM_ACTION")
+            return 2;
+
+        return 1;
+    }
+
+    if (verb != "GET")
+        return 1;
+
+    std::pair<std::string, std::string> const request = SplitOnce(payload, kFieldSeparator);
+    std::string const requestType = ToUpper(Trim(request.first));
+
+    if (requestType == "GAMEOBJECTS")
+    {
+        // Five playerbots "nearest ..." values per bot, and NearestUnitsValue is a
+        // CalculatedValue with checkInterval 1 - which means no caching at all, a fresh grid
+        // search on every single read. The addon's results frame sends this with an empty bot
+        // name, i.e. five grid searches times the whole visible pool.
+        bool const groupWide = Trim(SplitOnce(request.second, kFieldSeparator).first).empty();
+        return groupWide ? 4 : 2;
+    }
+
+    // Guild bank rights and contents are synchronous CharacterDatabase queries.
+    if (requestType == "GBANK")
+        return 2;
+
+    return 1;
+}
+
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
 {
     std::string const normalized = ToUpper(Trim(opcode));
 
     if (normalized == "HELLO")
     {
+        // The addon sends its own protocol version here. The bridge answers the same way either
+        // way (both sides negotiate by feature, not by refusing to talk), but a mismatch is worth
+        // saying out loud when someone has console logs on and is debugging a half-updated pair.
+        std::string const addonVersion = Trim(payload);
+        if (BridgeConsoleLogsEnabled() && !addonVersion.empty() && addonVersion != kProtocolVersion)
+            LOG_INFO(kLogFilter, "MultiBotBridge protocol mismatch: addon={} bridge={} player={}",
+                addonVersion, kProtocolVersion, player->GetName());
+
         SendAddonPacket(player, replyType, "HELLO_ACK", std::string(kProtocolVersion) + kFieldSeparator + kBridgeName);
         return true;
     }
@@ -4988,23 +5290,33 @@ public:
         if (!TryExtractBridgePayload(lang, msg, payload))
             return false;
 
-        // The addon paces its own sends, but the server must not trust the client: several
-        // GET~ verbs run synchronous DB queries on the world thread (QUESTS fallback,
-        // PVP_STATS, GBANK rights), so an unthrottled sender could stall the server.
-        // Throttled messages are dropped silently (returning true suppresses the chat line);
-        // the addon-side request watchdog then surfaces the timeout.
-        if (!PassesRequestThrottle(player))
+        ChatMsg const replyType = NormalizeReplyChatType(type);
+        std::pair<std::string, std::string> const packet = SplitOnce(payload, kFieldSeparator);
+
+        // The addon paces its own sends, but the server must not trust the client: several GET~
+        // verbs run synchronous DB queries or playerbots grid searches on the world thread, so an
+        // unthrottled sender could stall it. Charge the request by what answering it costs rather
+        // than pricing GET~GAMEOBJECTS the same as a PING.
+        bool notifyThrottled = false;
+        if (!PassesRequestThrottle(player, GetRequestCost(packet.first, packet.second), notifyThrottled))
         {
             if (BridgeConsoleLogsEnabled())
                 LOG_INFO(kLogFilter, "MultiBotBridge RX throttled [{}] player={}", payload, player->GetName());
+
+            // Say so, at most once per second per player: dropping silently left the addon with
+            // nothing but its watchdog timeout, which is indistinguishable from "the bridge is not
+            // installed". The rate limit keeps one inbound message from ever buying more than one
+            // outbound. The addon stores it in MultiBot.bridge.lastError.
+            if (notifyThrottled)
+                SendAddonPacket(player, replyType, "ERR",
+                    UrlEncodeField("THROTTLED") + std::string(1, kFieldSeparator) + UrlEncodeField(ToUpper(Trim(packet.first))));
+
             return true;
         }
 
         if (BridgeConsoleLogsEnabled())
             LOG_INFO(kLogFilter, "MultiBotBridge RX [{}] type={}", payload, type);
 
-        ChatMsg const replyType = NormalizeReplyChatType(type);
-        std::pair<std::string, std::string> const packet = SplitOnce(payload, kFieldSeparator);
         if (HandleBridgeOpcode(player, replyType, packet.first, packet.second))
             return true;
 
@@ -5025,19 +5337,29 @@ private:
     {
         double tokens = 0.0;
         uint32 lastRefillMs = 0;
+        uint32 lastThrottleNoticeMs = 0;
     };
 
     // Chat handling runs on the world thread, so no locking is needed here.
     std::unordered_map<ObjectGuid, RequestBucket> _requestBuckets;
 
-    bool PassesRequestThrottle(Player* player)
+    // `cost` is the request's token price (see GetRequestCost). `notify` comes back true at most
+    // once a second per player, so the caller can answer one dropped request with an ERR without
+    // turning a flood of them into a flood of replies.
+    bool PassesRequestThrottle(Player* player, uint32 cost, bool& notify)
     {
+        notify = false;
+
         uint32 const rate = BridgeRequestsPerSecond();
         if (!rate)
             return true;
 
         uint32 const burst = std::max<uint32>(1, BridgeRequestBurst());
         uint32 const now = getMSTime();
+
+        // Clamp to the bucket size: an admin who sets RequestBurst below a verb's cost should get
+        // a slow bridge, not one where that verb can never be answered at all.
+        cost = std::max<uint32>(1, std::min<uint32>(cost, burst));
 
         // Keep the map from growing with every player that ever sent a bridge message:
         // once it is large, drop buckets idle for more than five minutes.
@@ -5061,10 +5383,18 @@ private:
                 bucket.tokens + (static_cast<double>(getMSTimeDiff(bucket.lastRefillMs, now)) / 1000.0) * rate);
         bucket.lastRefillMs = now;
 
-        if (bucket.tokens < 1.0)
-            return false;
+        if (bucket.tokens < static_cast<double>(cost))
+        {
+            if (!bucket.lastThrottleNoticeMs || getMSTimeDiff(bucket.lastThrottleNoticeMs, now) >= 1000)
+            {
+                bucket.lastThrottleNoticeMs = now;
+                notify = true;
+            }
 
-        bucket.tokens -= 1.0;
+            return false;
+        }
+
+        bucket.tokens -= static_cast<double>(cost);
         return true;
     }
 
@@ -5097,8 +5427,22 @@ public:
     {
         LoadBridgeConfig();
 
-        if (!reload && BridgeConsoleLogsEnabled())
-            LOG_INFO("server.loading", "mod-multibot-bridge loaded");
+        // Unconditional: this line is how an admin confirms the module is in the build at all,
+        // and it used to be gated behind EnableConsoleLogs - which defaults to off, so the
+        // common "did it compile in?" question had no answer in the log. It is one line per
+        // startup, not per packet.
+        if (!reload)
+        {
+            LOG_INFO("server.loading", "mod-multibot-bridge loaded (protocol v{})", kProtocolVersion);
+
+            if (uint32 const rate = BridgeRequestsPerSecond())
+                LOG_INFO("server.loading", "mod-multibot-bridge: request throttle {}/s, burst {}", rate, BridgeRequestBurst());
+            else
+                LOG_INFO("server.loading", "mod-multibot-bridge: request throttle disabled");
+
+            if (uint32 const maxBots = BridgeMaxBotsPerRequest())
+                LOG_INFO("server.loading", "mod-multibot-bridge: serving at most {} bots per request", maxBots);
+        }
     }
 };
 } // namespace

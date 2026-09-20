@@ -309,9 +309,20 @@ bot name raw, and the addon reads it raw — safe on 3.3.5a, where a legal chara
 cannot contain `%`, `~`, `\r` or `\n`, but the two sides must stay aligned if that ever
 changes.
 
+**Prefix matching.** The bridge claims a message only when the addon prefix is *exactly* `MBOT`,
+i.e. when the client's `<prefix>	<message>` framing puts a tab right after it. Matching the
+prefix alone also matched every longer prefix starting with it (`MBOTX`, `MBOTLITE`, ...), and
+because a claimed message is suppressed rather than relayed, such an addon's traffic disappeared
+before reaching it.
+
 **Unknown verbs.** A message that carries the `MBOT` prefix is always consumed by the bridge,
 never relayed on as ordinary addon chat. An unimplemented verb is answered with
-`ERR~UNKNOWN_OPCODE~<verb>`.
+`ERR~UNKNOWN_OPCODE~<verb>`, and a request dropped by the throttle with `ERR~THROTTLED~<verb>`.
+
+**Bot names in requests.** A bot name sent by the addon is stripped of `~`, `%`, CR and LF before
+use. None of those can occur in a legal 3.3.5a character name, but the *request* is client-supplied
+and the streams that echo the requested name unencoded (`INV_*`, `SB_*`, `STATE`) would otherwise
+carry an attacker-chosen separator into the addon's field parsing.
 
 **Streaming.** Any list that could exceed the addon-message length limit is sent as a
 `<NAME>_BEGIN` / `<NAME>_ITEM` (one per element) / `<NAME>_END` sequence rather than a single
@@ -343,9 +354,27 @@ The exact payloads are consumed internally by the MultiBot addon.
 
 **Rate limiting.** Bridge requests are throttled per player with a token bucket
 (`MultiBotBridge.RequestsPerSecond`, default 10/s, and `MultiBotBridge.RequestBurst`,
-default 20, in `MultiBotBridge.conf`; set `RequestsPerSecond = 0` to disable). Requests
-beyond the budget are dropped silently — the addon's request watchdog surfaces the
-timeout on the client side.
+default 20, in `MultiBotBridge.conf`; set `RequestsPerSecond = 0` to disable). Requests are
+charged by what answering them costs rather than one token each:
+
+| Cost | Requests |
+|---|---|
+| 1 | everything not listed below |
+| 2 | `GET~GBANK`, `RUN~ITEM_ACTION`, `GET~GAMEOBJECTS` for a single bot |
+| 4 | `GET~GAMEOBJECTS` for the whole group |
+
+`GET~GAMEOBJECTS` is the outlier because it reads five playerbots `nearest ...` values per bot and
+those are `CalculatedValue`s with `checkInterval` 1 — no caching, a fresh grid search per read.
+A cost above `RequestBurst` is clamped to it, so a small burst makes the bridge slow rather than
+making a verb unanswerable.
+
+A dropped request is answered with `ERR~THROTTLED~<verb>`, at most once per second per player so
+one inbound message can never buy more than one outbound; the addon's request watchdog still
+surfaces the timeout.
+
+**Fan-out cap.** `MultiBotBridge.MaxBotsPerRequest` (default `0` = unlimited) bounds how many bots
+a single request is answered for, and how many a `RUN~` command with scope `ALL` reaches. It is an
+opt-in valve for pools larger than the worldserver should serve in one tick, not a default.
 
 > **Version history**
 > - **v2** — `ROSTER` is streamed as `ROSTER_BEGIN`/`ROSTER_ITEM`/`ROSTER_END` (was a single
@@ -395,6 +424,22 @@ timeout on the client side.
 > "unsupported", and disabled the feature for the rest of the session. Appending is safe because
 > `command` is URL-encoded and can never contain a separator; an older addon that stops reading
 > after it is unaffected.
+>
+> Additive, still v2: `ERR` gained a second reason, `THROTTLED`, alongside `UNKNOWN_OPCODE`
+> (`ERR~THROTTLED~<verb>`). Throttled requests used to be dropped with no reply at all, which on
+> the client is indistinguishable from "the bridge is not installed". The addon stores it in
+> `MultiBot.bridge.lastError` like any other `ERR` and needs no change.
+>
+> Behaviour, no wire change: `GET~PROFESSION_RECIPES` orders recipes by real difficulty (orange,
+> yellow, green, gray, then name) instead of alphabetically by colour name — the addon renders the
+> list in arrival order, so `gray` sorting first put trivial recipes at the top.
+>
+> Behaviour, no wire change: `GET~QUESTS` no longer falls back to `character_queststatus` when a
+> bot's runtime quest log is empty. `Player::_LoadQuestStatus` writes one quest-log slot per row of
+> that table at login and the bridge only ever sees logged-in bots, so the fallback could not add a
+> real quest — but it mapped raw status `0` (`QUEST_STATUS_NONE`, an abandoned row the core keeps
+> out of the log) to "incomplete" and listed those as quests in progress, at the cost of one
+> synchronous query per questless bot on every group-wide refresh.
 
 ---
 
@@ -443,7 +488,9 @@ timeout on the client side.
   </tr>
   <tr>
     <td><code>GET~BANK</code></td>
-    <td>Refresh bot bank contents when a banker is available near the bot.</td>
+    <td>Refresh bot bank contents when a <em>living</em> banker is near the bot. "Near" is
+    playerbots' sight distance, not the client's interaction range — the bot does not have to be
+    standing at the counter.</td>
   </tr>
   <tr>
     <td><code>GET~GBANK</code></td>
@@ -483,7 +530,8 @@ timeout on the client side.
   </tr>
   <tr>
     <td><code>GET~QUESTS</code></td>
-    <td>Refresh bot quest lists without localized chat parsing.</td>
+    <td>Refresh bot quest lists without localized chat parsing. Read from each bot's runtime
+    quest log, which is what <code>character_queststatus</code> was loaded into at login.</td>
   </tr>
   <tr>
     <td><code>GET~GAMEOBJECTS</code></td>
@@ -555,8 +603,10 @@ timeout on the client side.
   </tr>
   <tr>
     <td><code>ERR</code></td>
-    <td>Server-to-addon only. Sent when a well-formed <code>MBOT</code> message carries a verb
-    the bridge does not implement; the addon stores it in <code>MultiBot.bridge.lastError</code>.</td>
+    <td>Server-to-addon only. <code>ERR~UNKNOWN_OPCODE~&lt;verb&gt;</code> when a well-formed
+    <code>MBOT</code> message carries a verb the bridge does not implement;
+    <code>ERR~THROTTLED~&lt;verb&gt;</code> when the per-player throttle dropped the request (at
+    most one per second). The addon stores either in <code>MultiBot.bridge.lastError</code>.</td>
   </tr>
 </table>
 
@@ -685,6 +735,7 @@ For cooking recipes, `REQUIRES_SPELL_FOCUS` usually means the bot must be near a
 mod-multibot-bridge/
 ├── conf/
 │   └── MultiBotBridge.conf.dist
+├── include.sh
 └── src/
     ├── MultiBotBridge.cpp
     └── mod_multibot_bridge.cpp
