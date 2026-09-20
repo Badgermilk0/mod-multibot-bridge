@@ -125,6 +125,7 @@ void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
+void RunStrategyCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand);
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
@@ -148,6 +149,15 @@ std::string ToUpper(std::string value)
     // lambda deduce int made every ToUpper call narrow inside std::transform.
     std::transform(value.begin(), value.end(), value.begin(),
         [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return value;
+}
+
+// The mirror of ToUpper. Playerbots' strategy names are lower case, and three call sites were
+// already open-coding this transform.
+std::string ToLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
 
@@ -3928,6 +3938,71 @@ bool IsAllowedCombatCommand(std::string const& command)
     return true;
 }
 
+// STRATEGY: the per-class half of playerbots' strategy vocabulary.
+//
+// COMBAT above carries the handful of strategies that make sense for a whole party at once
+// (focus, threat, avoid aoe, ...). The per-class ones -- "this shaman heals rather than melees",
+// "this paladin keeps Blessing of Wisdom up" -- were left out, so the addon had to whisper them as
+// ordinary chat. That costs it everything the bridge exists to provide: no count of how many bots
+// actually applied the change, the client's chat throttle in the way, and the `,?` suffix the chat
+// form needs makes every bot echo its whole strategy list back into the chat frame.
+//
+// This is a separate verb rather than a wider COMBAT whitelist so the COMBAT contract an existing
+// v2 client relies on is untouched, and so the two allowlists can be reasoned about separately.
+//
+// Note what is NOT here: nothing that spends money, moves an item, or changes the world. A
+// strategy toggle only ever changes how a bot the requester already commands decides to act.
+bool IsAllowedStrategyCommand(std::string const& command)
+{
+    std::string const normalized = ToLower(Trim(command));
+
+    if (normalized.size() < 5)
+        return false;
+
+    // "co " / "nc " followed by "+" or "-".
+    std::string const verb = normalized.substr(0, 3);
+    if (verb != "co " && verb != "nc ")
+        return false;
+
+    char const sign = normalized[3];
+    if (sign != '+' && sign != '-')
+        return false;
+
+    std::string const strategy = Trim(normalized.substr(4));
+
+    // Combat strategies, taken from the per-class definitions the addon ships in Strategies/.
+    static std::set<std::string> const combatStrategies =
+    {
+        // Roles and specialisations
+        "tank", "heal", "dps", "caster", "melee", "ranged",
+        "bear", "cat", "blood", "frost", "unholy", "arcane", "fire", "frostfire",
+        "shadow", "holy dps", "holy heal",
+        // Layered behaviours
+        "offheal", "healer dps", "dps assist", "tank assist", "dps aoe", "aoe",
+        "caster aoe", "melee aoe", "cat aoe", "shadow aoe", "arcane aoe", "fire aoe",
+        "frost aoe", "unholy aoe", "frostfire aoe",
+        "dps debuff", "caster debuff", "shadow debuff",
+        "stealth", "stealthed", "boost", "firestarter", "trap weave", "meta melee",
+        "totems", "cure", "buff", "behind", "threat", "save mana", "avoid aoe", "focus",
+        // RTSC needs both of these before a bot will obey a saved position at all.
+        "rtsc", "guard"
+    };
+
+    // Non-combat upkeep: totems, auras, aspects, blessings, resistances. Named by effect, because
+    // one key means a different spell on every class that can provide it.
+    static std::set<std::string> const upkeepStrategies =
+    {
+        "bmana", "bdps", "bspeed", "barmor", "bcast", "baoe", "bhealth", "bstats",
+        "rfire", "rfrost", "rshadow", "rnature", "buff",
+        "food", "loot", "gather", "rtsc", "guard"
+    };
+
+    if (verb == "co ")
+        return combatStrategies.find(strategy) != combatStrategies.end();
+
+    return upkeepStrategies.find(strategy) != upkeepStrategies.end();
+}
+
 std::string NormalizeCombatCommand(std::string const& command)
 {
     std::string const trimmed = Trim(command);
@@ -4118,6 +4193,43 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
         << kFieldSeparator << UrlEncodeField(command);
 
     SendAddonPacket(requester, replyType, "COMBAT_ACK", payload.str());
+}
+
+// Mirrors RunCombatCommand exactly, including the scope model -- which is the real prize: `@tank`
+// filtering happens here, against the bots the requester actually commands, and the ack carries how
+// many of them applied it. The chat form could only ever hope.
+void RunStrategyCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const command = ToLower(Trim(UrlDecodeField(encodedCommand)));
+    uint32 executed = 0;
+
+    if (IsAllowedStrategyCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    {
+        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
+        {
+            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
+            if (!bot)
+                continue;
+
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
+                continue;
+
+            if (ExecuteSilentBotCommand(requester, bot, command))
+                ++executed;
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, "STRATEGY_ACK", payload.str());
 }
 
 void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
@@ -5210,6 +5322,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const actionRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const itemRequest = SplitOnce(actionRequest.second, kFieldSeparator);
             RunInventoryItemActionCommand(player, replyType, botRequest.first, tokenRequest.first, actionRequest.first, itemRequest.first, itemRequest.second);
+            return true;
+        }
+
+        if (requestType == "STRATEGY")
+        {
+            std::pair<std::string, std::string> const scopePart = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetPart = SplitOnce(scopePart.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenPart = SplitOnce(targetPart.second, kFieldSeparator);
+
+            RunStrategyCommand(player, replyType, scopePart.first, targetPart.first, tokenPart.first, tokenPart.second);
             return true;
         }
 

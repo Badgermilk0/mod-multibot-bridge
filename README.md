@@ -315,6 +315,13 @@ prefix alone also matched every longer prefix starting with it (`MBOTX`, `MBOTLI
 because a claimed message is suppressed rather than relayed, such an addon's traffic disappeared
 before reaching it.
 
+**Adding a verb does not bump the version.** Negotiation is by feature, not by version: the
+bridge answers `HELLO` the same way regardless, and an addon that does not know a verb simply never
+sends it. `RUN~STRATEGY` was added this way. The addon detects it the other direction — it sends
+the verb once and watches for `STRATEGY_ACK`; no ack before a short deadline and it falls back to
+plain chat for the rest of the session, so a **new addon against an old bridge keeps working**.
+Reserve a version bump for a change that alters an *existing* verb's framing.
+
 **Unknown verbs.** A message that carries the `MBOT` prefix is always consumed by the bridge,
 never relayed on as ordinary addon chat. An unimplemented verb is answered with
 `ERR~UNKNOWN_OPCODE~<verb>`, and a request dropped by the throttle with `ERR~THROTTLED~<verb>`.
@@ -562,6 +569,15 @@ opt-in valve for pools larger than the worldserver should serve in one tick, not
   <tr>
     <td><code>RUN~COMBAT</code></td>
     <td>Run whitelist-only combat strategy commands.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~STRATEGY</code></td>
+    <td>Run whitelist-only <em>per-class</em> strategy commands &mdash; <code>co +heal</code>,
+    <code>co +caster</code>, <code>nc +bmana</code>, <code>co +rtsc</code> and the rest of the
+    vocabulary the addon's per-bot role menu uses. Same scope model as <code>RUN~COMBAT</code>
+    (<code>ALL</code>/<code>GROUP</code>/<code>BOT</code> plus playerbots chat tags) and answers
+    <code>STRATEGY_ACK</code> with how many bots applied it. Kept separate from
+    <code>RUN~COMBAT</code> so that verb's existing contract is untouched.</td>
   </tr>
   <tr>
     <td><code>RUN~POSITION</code></td>
