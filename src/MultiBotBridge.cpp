@@ -2755,6 +2755,15 @@ bool LearnTrainerSpell(Player* bot, SpellInfo const* spellInfo, uint32 cost, std
         return false;
     }
 
+    // The core trainer puts a castable entry to OnPlayerCanLearnSpell before casting it (a cast
+    // runs more than learnSpell: a class mount steps Riding). Ask once, before any gold is taken,
+    // so a module that refuses the spell does not leave the bot charged for nothing.
+    if (!sScriptMgr->OnPlayerCanLearnSpell(bot, spellInfo->Id))
+    {
+        reason = "NOT_ALLOWED";
+        return false;
+    }
+
     if (!BotHasGoldCheat(bot))
     {
         if (GetBotTrainerFreeMoney(bot) < cost)
@@ -3973,10 +3982,11 @@ bool IsAllowedStrategyCommand(std::string const& command)
     // Combat strategies, taken from the per-class definitions the addon ships in Strategies/.
     static std::set<std::string> const combatStrategies =
     {
-        // Roles and specialisations. Since mod-playerbots #2836 the warrior, paladin and priest
-        // role strategies are named by spec (prot, ret, holy, disc); the role words still add them.
+        // Roles and specialisations. Playerbots names each class role strategy by spec; the role
+        // words (tank, heal, dps, caster, melee) are creator aliases of those, kept for older addons.
         "tank", "heal", "dps", "caster", "melee", "ranged",
-        "prot", "ret", "holy", "disc",
+        "prot", "arms", "fury", "ret", "holy", "disc", "resto", "balance", "ele", "enh",
+        "combat", "assassin", "subtlety", "affli", "demo", "destro",
         "bear", "cat", "blood", "frost", "unholy", "arcane", "fire", "frostfire",
         "shadow", "holy dps", "holy heal",
         // Layered behaviours
@@ -3990,11 +4000,13 @@ bool IsAllowedStrategyCommand(std::string const& command)
         "rtsc", "guard"
     };
 
-    // Non-combat upkeep: totems, auras, aspects, blessings, resistances. Named by effect, because
-    // one key means a different spell on every class that can provide it.
+    // Non-combat upkeep: auras, aspects, blessings, resistances. Mostly named by effect, because
+    // one key means a different spell on every class that can provide it; the paladin blessings
+    // are the exception (bkings, bwisdom, bmight, bsanc).
     static std::set<std::string> const upkeepStrategies =
     {
         "bmana", "bdps", "bspeed", "barmor", "bcast", "baoe", "bhealth", "bstats",
+        "bkings", "bwisdom", "bmight", "bsanc",
         "rfire", "rfrost", "rshadow", "rnature", "buff",
         "food", "loot", "gather", "rtsc", "guard"
     };
@@ -4197,33 +4209,6 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
     SendAddonPacket(requester, replyType, "COMBAT_ACK", payload.str());
 }
 
-// mod-playerbots (#2836) names the warrior, paladin and priest role strategies by spec (prot, ret,
-// holy, disc) and keeps the role words only as creator aliases. An alias adds the spec strategy,
-// but removal looks the name up exactly as given, so `co -tank` on a prot warrior did nothing.
-// Rewrite a removal to the name the alias resolves to for this bot, when that is what it holds.
-// `command` is already lower-cased and passed IsAllowedStrategyCommand.
-std::string ResolveStrategyRemoval(PlayerbotAI* botAI, std::string const& command)
-{
-    if (!botAI || command.size() < 5 || command[3] != '-')
-        return command;
-
-    std::string const name = Trim(command.substr(4));
-    BotState const state = command.compare(0, 3, "co ") == 0 ? BOT_STATE_COMBAT : BOT_STATE_NON_COMBAT;
-    if (botAI->HasStrategy(name, state))
-        return command;
-
-    AiObjectContext* const context = botAI->GetAiObjectContext();
-    Strategy* const strategy = context ? context->GetStrategy(name) : nullptr;
-    if (!strategy)
-        return command;
-
-    std::string const held = strategy->getName();
-    if (held == name || !botAI->HasStrategy(held, state))
-        return command;
-
-    return command.substr(0, 4) + held;
-}
-
 // Mirrors RunCombatCommand exactly, including the scope model -- which is the real prize: `@tank`
 // filtering happens here, against the bots the requester actually commands, and the ack carries how
 // many of them applied it. The chat form could only ever hope.
@@ -4246,8 +4231,7 @@ void RunStrategyCommand(Player* requester, ChatMsg replyType, std::string const&
             if (!BotMatchesCombatScope(requester, bot, scope, target))
                 continue;
 
-            std::string const botCommand = ResolveStrategyRemoval(sPlayerbotsMgr.GetPlayerbotAI(bot), command);
-            if (ExecuteSilentBotCommand(requester, bot, botCommand))
+            if (ExecuteSilentBotCommand(requester, bot, command))
                 ++executed;
         }
     }

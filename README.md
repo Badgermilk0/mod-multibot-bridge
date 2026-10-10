@@ -448,14 +448,18 @@ opt-in valve for pools larger than the worldserver should serve in one tick, not
 > out of the log) to "incomplete" and listed those as quests in progress, at the cost of one
 > synchronous query per questless bot on every group-wide refresh.
 >
-> Behaviour, no wire change: mod-playerbots #2836 renamed the warrior, paladin and priest role
-> strategies after their spec (`tank` → `prot`, paladin `dps` → `ret`, paladin `heal` → `holy`,
-> priest `heal` → `disc`) and kept the role words only as aliases that *add* the strategy.
-> Removal looks the name up exactly as given, so `co -tank` on a prot warrior did nothing.
-> `RUN~STRATEGY` now rewrites a removal per bot to the strategy the alias resolves to when the bot
-> holds that one, and accepts the four spec names as well. `STRATEGY_ACK` still echoes the command
-> as the addon sent it. Bots report the spec names in their `STATE` strategy lists, so an addon that matches
-> its role buttons on `tank`/`heal`/`dps` has to map them itself.
+> Behaviour, no wire change: `RUN~STRATEGY` accepts playerbots' real per-class strategy names as
+> well as the role words. Playerbots names each class role by spec (`prot`, `arms`, `fury`, `ret`,
+> `holy`, `disc`, `resto`, `balance`, `ele`, `enh`, `combat`, `assassin`, `subtlety`, `affli`,
+> `demo`, `destro`; #2836 renamed the warrior, paladin and priest ones) and keeps `tank`, `heal`,
+> `dps`, `caster` and `melee` only as aliases. Bots report the spec names in their `STATE`
+> strategy lists. The paladin blessings are `bkings`, `bwisdom`, `bmight` and `bsanc`; the older
+> `bhealth`/`bstats` keys stay accepted for older addons but no current class has them.
+>
+> Additive, still v2: `TRAINER_LEARN` can answer `ERR` with a new reason, `NOT_ALLOWED`. The bridge
+> now asks the core's `OnPlayerCanLearnSpell` hook before charging the bot, the same check the core
+> trainer applies to a castable entry, so a module that refuses a spell no longer leaves the bot
+> charged for nothing. An addon that does not know the reason shows it raw.
 
 ---
 
@@ -586,8 +590,7 @@ opt-in valve for pools larger than the worldserver should serve in one tick, not
     vocabulary the addon's per-bot role menu uses. Same scope model as <code>RUN~COMBAT</code>
     (<code>ALL</code>/<code>GROUP</code>/<code>BOT</code> plus playerbots chat tags) and answers
     <code>STRATEGY_ACK</code> with how many bots applied it. Kept separate from
-    <code>RUN~COMBAT</code> so that verb's existing contract is untouched. A role-word removal
-    (<code>co -tank</code>) is rewritten per bot to the spec strategy it holds (<code>prot</code>).</td>
+    <code>RUN~COMBAT</code> so that verb's existing contract is untouched.</td>
   </tr>
   <tr>
     <td><code>RUN~POSITION</code></td>
