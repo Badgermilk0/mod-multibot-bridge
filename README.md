@@ -315,12 +315,23 @@ prefix alone also matched every longer prefix starting with it (`MBOTX`, `MBOTLI
 because a claimed message is suppressed rather than relayed, such an addon's traffic disappeared
 before reaching it.
 
-**Adding a verb does not bump the version.** Negotiation is by feature, not by version: the
-bridge answers `HELLO` the same way regardless, and an addon that does not know a verb simply never
-sends it. `RUN~STRATEGY` was added this way. The addon detects it the other direction — it sends
-the verb once and watches for `STRATEGY_ACK`; no ack before a short deadline and it falls back to
-plain chat for the rest of the session, so a **new addon against an old bridge keeps working**.
-Reserve a version bump for a change that alters an *existing* verb's framing.
+**Capabilities, not version numbers.** Adding a verb or a scope does not move the protocol
+number: negotiation is by feature. `HELLO_ACK` carries a third field, a comma list of what this
+build can do beyond the bare protocol —
+
+| Capability | What it means |
+|---|---|
+| `audience` | the `ROLE` and `BOTS` scopes, and subgroup *lists* on `GROUP`, for every `RUN~` verb |
+| `order` | `RUN~ORDER` |
+| `strategy` | `RUN~STRATEGY`, validated by shape (comma lists, `~`, `!`) rather than against a list of names |
+| `roster2` | `ROSTER_ITEM` fields 8–12: role, power type, power, subgroup, flags |
+| `waittime` | `RUN~COMBAT` applies `wait for attack time` natively, with no per-bot whisper |
+
+— and the addon uses a feature only when it is listed. A bridge from before the list sends two
+fields, every capability reads as absent, and the addon says the same things in chat instead:
+**a new addon against an old bridge keeps working**, it is just noisier. An addon that predates the
+list reads the extra field as the tail of the server name and is unaffected. Reserve a version bump
+for a change that alters an *existing* verb's framing.
 
 **Unknown verbs.** A message that carries the `MBOT` prefix is always consumed by the bridge,
 never relayed on as ordinary addon chat. An unimplemented verb is answered with
@@ -342,14 +353,15 @@ Common request / response flow:
 
 ```text
 Addon  -> Server: MBOT HELLO~<protocolVersion>
-Server -> Addon:  MBOT HELLO_ACK~<protocolVersion>~mod-multibot-bridge
+Server -> Addon:  MBOT HELLO_ACK~<protocolVersion>~mod-multibot-bridge~<capability>,<capability>,...
 
 Addon  -> Server: MBOT PING~<token>
 Server -> Addon:  MBOT PONG~<token>
 
 Addon  -> Server: MBOT GET~ROSTER
 Server -> Addon:  MBOT ROSTER_BEGIN~
-                  MBOT ROSTER_ITEM~<name>,<class>,<level>,<map>,<alive>,<hp%>,<mp%>   (one per bot)
+                  MBOT ROSTER_ITEM~<name>,<class>,<level>,<map>,<alive>,<hp%>,<mana%>,
+                                   <role>,<powerType>,<power%>,<subgroup>,<flags>     (one per bot)
                   MBOT ROSTER_END~
 
 Addon  -> Server: MBOT GET~STATES
@@ -358,6 +370,51 @@ Server -> Addon:  MBOT STATE~<name>~<combatStrategies>~<nonCombatStrategies>    
 ```
 
 The exact payloads are consumed internally by the MultiBot addon.
+
+**Roster fields 8–12** (`roster2`). `role` is a bit mask of what *playerbots itself* thinks the
+bot is — `1` tank, `2` healer, `4` ranged; a bot with neither of the first two is a damage dealer —
+which is the answer that decides whom `@tank` and `ROLE~tank` reach, and not always what the
+talent trees suggest. `powerType` / `power%` are the bot's own bar (rage, energy, runic power …):
+the older `mana%` field is `0` for every class without mana. `subgroup` is `1`–`8` inside the
+requester's group and `0` outside it. `flags`: `1` in combat, `2` the requester is this bot's
+master. All five are appended, so a reader that stops at seven is unaffected.
+
+**Audience: who a `RUN~` verb reaches.** Every `RUN~` verb is addressed as `<scope>~<target>`, and
+they all resolve it the same way:
+
+| Scope | Target | Reaches |
+|---|---|---|
+| `ALL` (`RAID`) | — | every bot the requester can command, grouped or not |
+| `GROUP` (`PARTY`) | empty, or subgroups: `2`, `1,3`, `2-4` | bots in the requester's group, optionally only those subgroups |
+| `BOT` | a name | that bot |
+| `BOTS` | `Name1,Name2,…` (at most 40) | those bots |
+| `ROLE` | `tank`, `heal`, `dps`, `melee`, `ranged`, `meleedps`, `rangeddps` | bots in the requester's group filling that role |
+
+`ROLE` is evaluated with the same predicates playerbots' own chat filter uses, so `ROLE~tank`
+reaches exactly the bots `@tank` would. Doing it on the bridge rather than forwarding an `@tank`
+prefix is what lets the ack carry a true count: `PlayerbotAI::HandleCommand` returns nothing, so a
+forwarded filter can only report how many bots were *offered* the line. An unknown scope, or a
+target that does not fit it, is still acknowledged — with `executed` `0`.
+
+**`RUN~ORDER`** delivers any line the requester could type to a bot — `follow`,
+`do attack my target`, `formation line`, `rti skull` — to an audience, and answers
+`ORDER_ACK~scope~target~token~executed~command`. There is deliberately no allowlist: the line is
+handed to `PlayerbotAI::HandleCommand` as a whisper from the requester, which applies playerbots'
+own security check for that player against that bot, exactly as when the same words are typed. The
+bridge adds a fan-out and a count, not a privilege; it only insists on a sane line (at most 200
+bytes, no control characters).
+
+**`RUN~STRATEGY`** takes playerbots' own `co` / `nc` syntax: a comma list of `+name`, `-name`,
+`~name` (toggle) and `!` (drop everything and restore the class and spec defaults). `?` is refused —
+it makes every bot whisper its strategy list back, the one thing the verb exists to avoid. Names are
+checked for shape, not against a list: a second copy of playerbots' vocabulary went stale the day
+its role strategies were renamed, and it guarded nothing, since an unknown name is a no-op inside
+playerbots.
+
+**`RUN~COMBAT`** accepts any `co` strategy change the same way, plus `wait for attack time <0-60>`,
+which is set directly on the bot. It keeps one historical alias: `co ±dps aoe` is mapped to
+`co ±aoe`. playerbots does have a strategy literally named `dps aoe`, but it is a target-selection
+strategy in the same sibling set as `tank assist`; use `RUN~STRATEGY` to reach that one.
 
 **Rate limiting.** Bridge requests are throttled per player with a token bucket
 (`MultiBotBridge.RequestsPerSecond`, default 10/s, and `MultiBotBridge.RequestBurst`,
@@ -387,8 +444,16 @@ opt-in valve for pools larger than the worldserver should serve in one tick, not
 > - **v2** — `ROSTER` is streamed as `ROSTER_BEGIN`/`ROSTER_ITEM`/`ROSTER_END` (was a single
 >   `ROSTER~a;b;c` message that could be truncated for large raids); roster names are now
 >   URL-encoded; `DETAIL` and `STATE` streams always emit their `DETAILS`/`STATES` terminator.
->   A v2 addon still accepts a v1 single-message `ROSTER` from an older bridge.
-> - **v1** — initial bridge protocol.
+> - **v1** — initial bridge protocol. The addon no longer understands its single-message forms.
+>
+> Additive, still v2 — **capabilities, audiences and orders.** `HELLO_ACK` gained a third field,
+> the capability list. Every `RUN~` verb resolves its scope through one shared matcher, which adds
+> `ROLE`, `BOTS` and subgroup lists; `RUN~RTI` with `GROUP` and no number now means the requester's
+> whole group, as it always did for the other verbs (it used to match no bot at all). `RUN~ORDER`
+> is new. `RUN~STRATEGY` and `RUN~COMBAT` validate a strategy command by shape instead of against
+> a list of names, and accept comma lists, `~` and `!`. `RUN~COMBAT` sets `wait for attack time`
+> on the bot directly. `ROSTER_ITEM` carries five more fields. Every existing request is answered
+> as before, so an addon that predates all of it keeps working.
 >
 > Additive, still v2 (no bump — every existing opcode is byte-for-byte unchanged, so older v2
 > addons keep working): the bridge now answers unknown verbs with `ERR`, always terminates the
@@ -580,17 +645,20 @@ opt-in valve for pools larger than the worldserver should serve in one tick, not
     <td>Run whitelist-only RTI icon and RTI target commands.</td>
   </tr>
   <tr>
+    <td><code>RUN~ORDER</code></td>
+    <td>Deliver any bot command line to an audience (everyone, a role, subgroups, named bots) and
+    answer <code>ORDER_ACK</code> with how many bots it reached.</td>
+  </tr>
+  <tr>
     <td><code>RUN~COMBAT</code></td>
-    <td>Run whitelist-only combat strategy commands.</td>
+    <td>Run combat (<code>co</code>) strategy changes for an audience, and set the pull delay
+    (<code>wait for attack time</code>) natively.</td>
   </tr>
   <tr>
     <td><code>RUN~STRATEGY</code></td>
-    <td>Run whitelist-only <em>per-class</em> strategy commands &mdash; <code>co +heal</code>,
-    <code>co +caster</code>, <code>nc +bmana</code>, <code>co +rtsc</code> and the rest of the
-    vocabulary the addon's per-bot role menu uses. Same scope model as <code>RUN~COMBAT</code>
-    (<code>ALL</code>/<code>GROUP</code>/<code>BOT</code> plus playerbots chat tags) and answers
-    <code>STRATEGY_ACK</code> with how many bots applied it. Kept separate from
-    <code>RUN~COMBAT</code> so that verb's existing contract is untouched.</td>
+    <td>Run any <code>co</code> / <code>nc</code> strategy change for an audience &mdash;
+    one, a comma list, a toggle, or <code>!</code> to restore the class defaults &mdash; silently,
+    answering <code>STRATEGY_ACK</code> with how many bots it reached.</td>
   </tr>
   <tr>
     <td><code>RUN~POSITION</code></td>

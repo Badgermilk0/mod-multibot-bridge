@@ -54,6 +54,15 @@ namespace
 char const* const kAddonPrefix = "MBOT";
 char const* const kBridgeName = "mod-multibot-bridge";
 char const* const kProtocolVersion = "2"; // v2: ROSTER streamed (ROSTER_BEGIN/ITEM/END), DETAILS/STATES always terminated.
+// What this build can do beyond the bare protocol number, sent as the third HELLO_ACK field.
+// Adding a verb or a scope does not move the protocol number - both sides negotiate by feature -
+// so without this list the addon could only find out by sending a request and timing the silence.
+//   audience  ROLE and BOTS scopes, and subgroup lists on GROUP, for every RUN~ verb
+//   order     RUN~ORDER
+//   strategy  RUN~STRATEGY, with comma lists and `!`
+//   roster2   ROSTER_ITEM fields 8-12 (role, power type, power, subgroup, flags)
+//   waittime  RUN~COMBAT applies `wait for attack time` natively (no per-bot whisper)
+char const* const kCapabilities = "audience,order,strategy,roster2,waittime";
 char const kFieldSeparator = '~';
 // Own log filter rather than borrowing playerbots': an unconfigured filter falls back to
 // Logger.root, so bridge diagnostics stay visible even without a Logger.multibotbridge line.
@@ -3828,6 +3837,277 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
     SendAddonPacket(requester, replyType, "OUTFITS_CMD", payload.str());
 }
 
+// ---------------------------------------------------------------------------------------------
+// Audience: who a RUN~ verb is addressed to.
+//
+// Every RUN~ verb carries `<scope>~<target>` and they all resolve it here, so "the tanks" means the
+// same bots whichever verb is asked. The scopes:
+//
+//   ALL / RAID        every bot the requester can command, grouped or not
+//   GROUP / PARTY     bots in the requester's group; with a target, only those subgroups ("2",
+//                     "1,3", "2-4" - the same list syntax as playerbots' @group filter)
+//   BOT               one bot, by name
+//   BOTS              several bots, by a comma-separated list of names
+//   ROLE              bots in the requester's group that fill a role: tank, heal, dps, melee,
+//                     ranged, meleedps, rangeddps
+//
+// ROLE is evaluated with the same predicates playerbots' own chat filter uses (StrategyChatFilter
+// in Bot/Cmd/ChatFilter.cpp), so `ROLE~tank` reaches exactly the bots `@tank` would. Doing it here
+// rather than forwarding an `@tank` prefix is what lets the ack carry a true count: HandleCommand
+// returns nothing, so a forwarded filter can only ever report how many bots were *offered* the line.
+//
+// The addon used to have nothing but ALL / GROUP / BOT, so a role picked on its bar silently
+// degraded to "everyone in the group" for every bridge verb - the label said Tanks and the whole
+// raid changed strategy.
+enum class BridgeRole : uint8
+{
+    None,
+    Tank,
+    Heal,
+    Dps,
+    Melee,
+    Ranged,
+    MeleeDps,
+    RangedDps
+};
+
+struct BridgeAudience
+{
+    enum class Kind : uint8
+    {
+        All,
+        Group,
+        Bot,
+        Bots,
+        Role
+    };
+
+    Kind kind = Kind::All;
+    std::set<uint8> subgroups;             // Kind::Group, zero-based; empty = the whole group
+    std::unordered_set<std::string> names; // Kind::Bot / Kind::Bots
+    BridgeRole role = BridgeRole::None;    // Kind::Role
+};
+
+// A raid has 40 members; a list longer than that is not a list of the requester's bots.
+constexpr std::size_t kMaxAudienceNames = 40;
+
+BridgeRole ParseBridgeRole(std::string const& value)
+{
+    std::string const role = ToLower(Trim(value));
+
+    if (role == "tank")
+        return BridgeRole::Tank;
+    if (role == "heal" || role == "healer")
+        return BridgeRole::Heal;
+    if (role == "dps")
+        return BridgeRole::Dps;
+    if (role == "melee")
+        return BridgeRole::Melee;
+    if (role == "ranged")
+        return BridgeRole::Ranged;
+    if (role == "meleedps")
+        return BridgeRole::MeleeDps;
+    if (role == "rangeddps")
+        return BridgeRole::RangedDps;
+
+    return BridgeRole::None;
+}
+
+bool ParseSubgroupNumber(std::string const& value, uint32& number)
+{
+    std::string const text = Trim(value);
+    if (text.empty() || text.size() > 1 || !std::isdigit(static_cast<unsigned char>(text[0])))
+        return false;
+
+    number = static_cast<uint32>(text[0] - '0');
+    return number >= 1 && number <= MAX_RAID_SUBGROUPS;
+}
+
+// "2", "1,3", "2-4", "1,3-5". Stored zero-based, the way Group::GetMemberGroup reports them.
+bool ParseSubgroupList(std::string const& value, std::set<uint8>& subgroups)
+{
+    std::istringstream in(value);
+    std::string token;
+
+    while (std::getline(in, token, ','))
+    {
+        std::pair<std::string, std::string> const range = SplitOnce(token, '-');
+        uint32 from = 0;
+        uint32 to = 0;
+
+        if (!ParseSubgroupNumber(range.first, from))
+            return false;
+
+        if (token.find('-') == std::string::npos)
+            to = from;
+        else if (!ParseSubgroupNumber(range.second, to))
+            return false;
+
+        if (from > to)
+            std::swap(from, to);
+
+        for (uint32 number = from; number <= to; ++number)
+            subgroups.insert(static_cast<uint8>(number - 1));
+    }
+
+    return !subgroups.empty();
+}
+
+// Returns false for a scope it does not know or a target that does not fit the scope. Callers
+// still answer with an ack (executed 0): the addon is waiting for one either way.
+bool ParseBridgeAudience(std::string const& scopeValue, std::string const& targetValue, BridgeAudience& audience)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(targetValue);
+
+    if (scope == "ALL" || scope == "RAID")
+    {
+        audience.kind = BridgeAudience::Kind::All;
+        return true;
+    }
+
+    if (scope == "GROUP" || scope == "PARTY")
+    {
+        audience.kind = BridgeAudience::Kind::Group;
+        return target.empty() || ParseSubgroupList(target, audience.subgroups);
+    }
+
+    if (scope == "BOT")
+    {
+        std::string const name = TrimBotName(target);
+        if (name.empty())
+            return false;
+
+        audience.kind = BridgeAudience::Kind::Bot;
+        audience.names.insert(name);
+        return true;
+    }
+
+    if (scope == "BOTS")
+    {
+        std::istringstream in(target);
+        std::string token;
+
+        while (std::getline(in, token, ','))
+        {
+            std::string const name = TrimBotName(token);
+            if (name.empty())
+                continue;
+
+            if (audience.names.size() >= kMaxAudienceNames)
+                return false;
+
+            audience.names.insert(name);
+        }
+
+        audience.kind = BridgeAudience::Kind::Bots;
+        return !audience.names.empty();
+    }
+
+    if (scope == "ROLE")
+    {
+        audience.kind = BridgeAudience::Kind::Role;
+        audience.role = ParseBridgeRole(target);
+        return audience.role != BridgeRole::None;
+    }
+
+    return false;
+}
+
+// Mirrors StrategyChatFilter: @dps is "neither tank nor healer", @melee is "not ranged", and the
+// two combined filters require both halves.
+bool BotMatchesRole(Player* bot, BridgeRole role)
+{
+    switch (role)
+    {
+        case BridgeRole::Tank:
+            return PlayerbotAI::IsTank(bot);
+        case BridgeRole::Heal:
+            return PlayerbotAI::IsHeal(bot);
+        case BridgeRole::Dps:
+            return !PlayerbotAI::IsTank(bot) && !PlayerbotAI::IsHeal(bot);
+        case BridgeRole::Melee:
+            return !PlayerbotAI::IsRanged(bot);
+        case BridgeRole::Ranged:
+            return PlayerbotAI::IsRanged(bot);
+        case BridgeRole::MeleeDps:
+            return !PlayerbotAI::IsRanged(bot) && !PlayerbotAI::IsTank(bot) && !PlayerbotAI::IsHeal(bot);
+        case BridgeRole::RangedDps:
+            return PlayerbotAI::IsRanged(bot) && !PlayerbotAI::IsTank(bot) && !PlayerbotAI::IsHeal(bot);
+        default:
+            return false;
+    }
+}
+
+bool BotMatchesAudience(Player* requester, Player* bot, BridgeAudience const& audience)
+{
+    if (!requester || !bot)
+        return false;
+
+    switch (audience.kind)
+    {
+        case BridgeAudience::Kind::All:
+            return true;
+
+        case BridgeAudience::Kind::Bot:
+        case BridgeAudience::Kind::Bots:
+            return audience.names.find(bot->GetName()) != audience.names.end();
+
+        case BridgeAudience::Kind::Group:
+        case BridgeAudience::Kind::Role:
+        {
+            // Both are about the requester's own group. A bot that is logged in for the requester
+            // but was never grouped (a half-failed `.playerbot bot add`) is reachable by ALL and
+            // by name, and by nothing that says "my group".
+            Group* const group = requester->GetGroup();
+            if (!group || bot->GetGroup() != group)
+                return false;
+
+            if (audience.kind == BridgeAudience::Kind::Role)
+                return BotMatchesRole(bot, audience.role);
+
+            return audience.subgroups.empty() ||
+                audience.subgroups.find(group->GetMemberGroup(bot->GetGUID())) != audience.subgroups.end();
+        }
+    }
+
+    return false;
+}
+
+// Walks the audience over a GUID snapshot (see GetBridgeVisibleBotGuids) and returns how many
+// bots `apply` reported success for.
+template<typename Apply>
+uint32 ForEachAudienceBot(Player* requester, BridgeAudience const& audience, Apply apply)
+{
+    uint32 applied = 0;
+
+    for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
+    {
+        Player* const bot = ObjectAccessor::FindPlayer(botGuid);
+        if (!bot || !BotMatchesAudience(requester, bot, audience))
+            continue;
+
+        if (apply(bot))
+            ++applied;
+    }
+
+    return applied;
+}
+
+// The shared shape of every RUN~ ack: `scope~target~token~executed~command`.
+void SendCommandAck(Player* requester, ChatMsg replyType, char const* opcode, std::string const& scope,
+    std::string const& target, std::string const& token, uint32 executed, std::string const& command)
+{
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, opcode, payload.str());
+}
+
 bool IsAllowedRTIIcon(std::string const& value)
 {
     static std::set<std::string> const allowed = { "STAR", "CIRCLE", "DIAMOND", "TRIANGLE", "MOON", "SQUARE", "CROSS", "SKULL" };
@@ -3894,47 +4174,88 @@ bool ApplyNativeDisperseCommand(Player* bot, std::string const& command)
     return true;
 }
 
-bool IsAllowedCombatCommand(std::string const& command)
+// A playerbots strategy name: lower-case words, digits, and the two joiners its dungeon
+// strategies use ("wotlk-uk", "bwl"). Deliberately a shape and not a list - see below.
+bool IsValidStrategyName(std::string const& name)
 {
-    std::string const normalized = ToUpper(Trim(command));
-
-    static std::set<std::string> const allowed =
-    {
-        "CO +FOCUS",
-        "CO -FOCUS",
-        "CO +DPS ASSIST",
-        "CO -DPS ASSIST",
-        "CO +AOE",
-        "CO -AOE",
-        "CO +DPS AOE",
-        "CO -DPS AOE",
-        "CO +TANK ASSIST",
-        "CO -TANK ASSIST",
-        "CO +AVOID AOE",
-        "CO -AVOID AOE",
-        "CO +SAVE MANA",
-        "CO -SAVE MANA",
-        "CO +THREAT",
-        "CO -THREAT",
-        "CO +BEHIND",
-        "CO -BEHIND",
-        "CO +WAIT FOR ATTACK",
-        "CO -WAIT FOR ATTACK"
-    };
-
-    if (allowed.find(normalized) != allowed.end())
-        return true;
-
-    static std::string const waitPrefix = "WAIT FOR ATTACK TIME ";
-    if (normalized.rfind(waitPrefix, 0) != 0)
+    if (name.empty() || name.size() > 40)
         return false;
 
-    std::string const value = Trim(normalized.substr(waitPrefix.size()));
+    for (char const c : name)
+        if (!std::islower(static_cast<unsigned char>(c)) && !std::isdigit(static_cast<unsigned char>(c)) &&
+            c != ' ' && c != '_' && c != '-')
+            return false;
+
+    return true;
+}
+
+// STRATEGY: `co ...` / `nc ...` strategy changes, applied silently and counted.
+//
+// The command is playerbots' own syntax: a comma-separated list of `+name` (add), `-name` (remove),
+// `~name` (toggle) and `!` (drop everything and restore the class/spec defaults). What is refused
+// is `?`, which makes every bot whisper its whole strategy list back - the one thing this verb
+// exists to avoid - and anything that is not a strategy change at all.
+//
+// This used to check each name against a list of strategies copied from the addon. That list went
+// stale the day playerbots renamed its role strategies (#2836): thirty buttons kept sending names
+// the bridge still accepted and playerbots no longer knew. A second copy of playerbots' vocabulary
+// can only ever be wrong, and it guards nothing - a strategy toggle changes how a bot the
+// requester already commands decides to act, an unknown name is a no-op inside playerbots, and
+// the requester could whisper the same line to the bot anyway. So the shape is validated and the
+// vocabulary is left to the one place that owns it.
+bool IsAllowedStrategyCommand(std::string const& command)
+{
+    std::string const normalized = ToLower(Trim(command));
+
+    if (normalized.size() < 4 || normalized.size() > 200)
+        return false;
+
+    std::string const verb = normalized.substr(0, 3);
+    if (verb != "co " && verb != "nc ")
+        return false;
+
+    std::istringstream items(normalized.substr(3));
+    std::string item;
+    bool any = false;
+
+    while (std::getline(items, item, ','))
+    {
+        item = Trim(item);
+
+        if (item == "!")
+        {
+            any = true;
+            continue;
+        }
+
+        if (item.size() < 2 || (item[0] != '+' && item[0] != '-' && item[0] != '~'))
+            return false;
+
+        if (!IsValidStrategyName(Trim(item.substr(1))))
+            return false;
+
+        any = true;
+    }
+
+    return any;
+}
+
+// "wait for attack time <seconds>": how long bots hold back at the start of a fight. It only has
+// an effect while the `wait for attack` combat strategy is on, which is a separate `co` command.
+bool ParseWaitForAttackTime(std::string const& command, uint32& seconds)
+{
+    static std::string const prefix = "WAIT FOR ATTACK TIME ";
+
+    std::string const normalized = ToUpper(Trim(command));
+    if (normalized.rfind(prefix, 0) != 0)
+        return false;
+
+    std::string const value = Trim(normalized.substr(prefix.size()));
     if (value.empty())
         return false;
 
-    uint32 seconds = 0;
-    for (char c : value)
+    seconds = 0;
+    for (char const c : value)
     {
         if (!std::isdigit(static_cast<unsigned char>(c)))
             return false;
@@ -3947,74 +4268,35 @@ bool IsAllowedCombatCommand(std::string const& command)
     return true;
 }
 
-// STRATEGY: the per-class half of playerbots' strategy vocabulary.
-//
-// COMBAT above carries the handful of strategies that make sense for a whole party at once
-// (focus, threat, avoid aoe, ...). The per-class ones -- "this shaman heals rather than melees",
-// "this paladin keeps Blessing of Wisdom up" -- were left out, so the addon had to whisper them as
-// ordinary chat. That costs it everything the bridge exists to provide: no count of how many bots
-// actually applied the change, the client's chat throttle in the way, and the `,?` suffix the chat
-// form needs makes every bot echo its whole strategy list back into the chat frame.
-//
-// This is a separate verb rather than a wider COMBAT whitelist so the COMBAT contract an existing
-// v2 client relies on is untouched, and so the two allowlists can be reasoned about separately.
-//
-// Note what is NOT here: nothing that spends money, moves an item, or changes the world. A
-// strategy toggle only ever changes how a bot the requester already commands decides to act.
-bool IsAllowedStrategyCommand(std::string const& command)
+// Sets the value directly instead of forwarding the chat command, exactly as disperse is. The
+// chat form answers "Wait for attack time set to N seconds" by whisper from every bot it reaches:
+// forty lines in the chat frame for one click on a pull preset.
+bool ApplyNativeWaitForAttackTime(Player* bot, uint32 seconds)
 {
-    std::string const normalized = ToLower(Trim(command));
-
-    if (normalized.size() < 5)
+    if (!bot)
         return false;
 
-    // "co " / "nc " followed by "+" or "-".
-    std::string const verb = normalized.substr(0, 3);
-    if (verb != "co " && verb != "nc ")
+    PlayerbotAI* const ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!ai || !ai->GetAiObjectContext())
         return false;
 
-    char const sign = normalized[3];
-    if (sign != '+' && sign != '-')
+    Value<uint8>* const waitTime = ai->GetAiObjectContext()->GetValue<uint8>("wait for attack time");
+    if (!waitTime)
         return false;
 
-    std::string const strategy = Trim(normalized.substr(4));
+    waitTime->Set(static_cast<uint8>(seconds));
+    return true;
+}
 
-    // Combat strategies, taken from the per-class definitions the addon ships in Strategies/.
-    static std::set<std::string> const combatStrategies =
-    {
-        // Roles and specialisations. Playerbots names each class role strategy by spec; the role
-        // words (tank, heal, dps, caster, melee) are creator aliases of those, kept for older addons.
-        "tank", "heal", "dps", "caster", "melee", "ranged",
-        "prot", "arms", "fury", "ret", "holy", "disc", "resto", "balance", "ele", "enh",
-        "combat", "assassin", "subtlety", "affli", "demo", "destro",
-        "bear", "cat", "blood", "frost", "unholy", "arcane", "fire", "frostfire",
-        "shadow", "holy dps", "holy heal",
-        // Layered behaviours
-        "offheal", "healer dps", "dps assist", "tank assist", "dps aoe", "aoe",
-        "caster aoe", "melee aoe", "cat aoe", "shadow aoe", "arcane aoe", "fire aoe",
-        "frost aoe", "unholy aoe", "frostfire aoe",
-        "dps debuff", "caster debuff", "shadow debuff",
-        "stealth", "stealthed", "boost", "firestarter", "trap weave", "meta melee",
-        "totems", "cure", "buff", "behind", "threat", "save mana", "avoid aoe", "focus",
-        // RTSC needs both of these before a bot will obey a saved position at all.
-        "rtsc", "guard"
-    };
+// COMBAT: the audience-wide strategies, plus the pull delay. Any `co` strategy change is accepted
+// (see IsAllowedStrategyCommand for why there is no list); `nc` belongs to STRATEGY and LOOT.
+bool IsAllowedCombatCommand(std::string const& command)
+{
+    uint32 seconds = 0;
+    if (ParseWaitForAttackTime(command, seconds))
+        return true;
 
-    // Non-combat upkeep: auras, aspects, blessings, resistances. Mostly named by effect, because
-    // one key means a different spell on every class that can provide it; the paladin blessings
-    // are the exception (bkings, bwisdom, bmight, bsanc).
-    static std::set<std::string> const upkeepStrategies =
-    {
-        "bmana", "bdps", "bspeed", "barmor", "bcast", "baoe", "bhealth", "bstats",
-        "bkings", "bwisdom", "bmight", "bsanc",
-        "rfire", "rfrost", "rshadow", "rnature", "buff",
-        "food", "loot", "gather", "rtsc", "guard"
-    };
-
-    if (verb == "co ")
-        return combatStrategies.find(strategy) != combatStrategies.end();
-
-    return upkeepStrategies.find(strategy) != upkeepStrategies.end();
+    return ToLower(Trim(command)).rfind("co ", 0) == 0 && IsAllowedStrategyCommand(command);
 }
 
 std::string NormalizeCombatCommand(std::string const& command)
@@ -4022,8 +4304,11 @@ std::string NormalizeCombatCommand(std::string const& command)
     std::string const trimmed = Trim(command);
     std::string const normalized = ToUpper(trimmed);
 
-    // Backward compatibility with the first addon patch.
-    // Playerbots exposes the strategy as "aoe", not "dps aoe".
+    // The first addon patch sent "dps aoe" meaning "use area damage", and this verb has mapped it
+    // onto the `aoe` strategy ever since. It stays for an addon that still sends it: playerbots
+    // does have a strategy literally named `dps aoe`, but it is a target-selection strategy in the
+    // same sibling set as `tank assist`, so letting the old wording through unmapped would strip
+    // every tank of its own. RUN~STRATEGY carries no such alias and reaches the real one.
     if (normalized == "CO +DPS AOE")
         return "co +aoe";
 
@@ -4035,11 +4320,7 @@ std::string NormalizeCombatCommand(std::string const& command)
 
 std::string NormalizePositionCommand(std::string const& command)
 {
-    std::string normalized = Trim(command);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c)
-    {
-        return static_cast<char>(std::tolower(c));
-    });
+    std::string const normalized = ToLower(Trim(command));
 
     if (normalized == "disperse disable")
         return normalized;
@@ -4062,17 +4343,6 @@ std::string NormalizePositionCommand(std::string const& command)
     return out.str();
 }
 
-std::string NormalizeLootCommand(std::string const& command)
-{
-    std::string normalized = Trim(command);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c)
-    {
-        return static_cast<char>(std::tolower(c));
-    });
-
-    return normalized;
-}
-
 bool IsAllowedLootCommand(std::string const& command)
 {
     static std::set<std::string> const allowed =
@@ -4089,231 +4359,138 @@ bool IsAllowedLootCommand(std::string const& command)
     return allowed.find(Trim(command)) != allowed.end();
 }
 
-bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
+// ORDER: any line the requester could type to a bot, delivered to an audience and counted.
+//
+// "follow", "do attack my target", "formation line", "summon", "rti skull" - the plain orders the
+// addon's bar gives. They used to go out as party chat with a role prefix, which works, and costs
+// three things: every real player in the group reads the commands, the client's chat throttle
+// paces them, and nothing comes back to say whether a single bot was listening.
+//
+// There is deliberately no allowlist. The line is handed to PlayerbotAI::HandleCommand as a whisper
+// from the requester, which applies playerbots' own security check for that player against that
+// bot - exactly what happens when the same words are typed. The bridge adds a fan-out and a count,
+// not a privilege. What it does insist on is a sane line: bounded, and free of control characters.
+bool IsAllowedOrderCommand(std::string const& command)
 {
-    if (!requester || !bot)
+    if (command.empty() || command.size() > 200)
         return false;
 
-    if (scope == "ALL")
-        return true;
-
-    if (scope == "BOT")
-        return bot->GetName() == target;
-
-    if (scope == "GROUP")
-    {
-        uint32 groupNumber = static_cast<uint32>(std::strtoul(target.c_str(), nullptr, 10));
-        if (groupNumber < 1 || groupNumber > 8)
+    for (char const c : command)
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
             return false;
 
-        Group* const group = requester->GetGroup();
-        if (!group || bot->GetGroup() != group)
-            return false;
-
-        return group->GetMemberGroup(bot->GetGUID()) == groupNumber - 1;
-    }
-
-    return false;
+    return true;
 }
 
-bool BotMatchesCombatScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
+void RunOrderCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
-    if (!requester || !bot)
-        return false;
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const command = Trim(UrlDecodeField(encodedCommand));
+    uint32 executed = 0;
 
-    if (scope == "ALL" || scope == "RAID")
-        return true;
+    BridgeAudience audience;
+    if (IsAllowedOrderCommand(command) && ParseBridgeAudience(scope, target, audience))
+        executed = ForEachAudienceBot(requester, audience, [requester, &command](Player* bot)
+        {
+            return ExecuteSilentBotCommand(requester, bot, command);
+        });
 
-    if (scope == "GROUP" || scope == "PARTY")
-    {
-        if (!target.empty())
-            return BotMatchesRTIScope(requester, bot, "GROUP", target);
-
-        Group* const group = requester->GetGroup();
-        if (!group)
-            return false;
-
-        return bot->GetGroup() == group;
-    }
-
-    return BotMatchesRTIScope(requester, bot, scope, target);
+    SendCommandAck(requester, replyType, "ORDER_ACK", scope, target, Trim(requestToken), executed, command);
 }
 
 void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
     std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
-    std::string const command = NormalizeCombatCommand(rawCommand);
+    std::string const command = Trim(UrlDecodeField(encodedCommand));
     uint32 executed = 0;
 
-    if (IsAllowedRTICommand(command) && (scope == "ALL" || scope == "GROUP" || scope == "BOT"))
-    {
-        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
+    BridgeAudience audience;
+    if (IsAllowedRTICommand(command) && ParseBridgeAudience(scope, target, audience))
+        executed = ForEachAudienceBot(requester, audience, [requester, &command](Player* bot)
         {
-            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
-            if (!bot)
-                continue;
+            return ExecuteSilentBotCommand(requester, bot, command);
+        });
 
-            if (!BotMatchesRTIScope(requester, bot, scope, target))
-                continue;
-
-            if (ExecuteSilentBotCommand(requester, bot, command))
-                ++executed;
-        }
-    }
-
-    std::ostringstream payload;
-    payload << scope
-        << kFieldSeparator << UrlEncodeField(target)
-        << kFieldSeparator << token
-        << kFieldSeparator << executed
-        << kFieldSeparator << UrlEncodeField(command);
-
-    SendAddonPacket(requester, replyType, "RTI_ACK", payload.str());
+    SendCommandAck(requester, replyType, "RTI_ACK", scope, target, Trim(requestToken), executed, command);
 }
 
 void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
     std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
-    std::string const command = NormalizeCombatCommand(rawCommand);
+    std::string const command = NormalizeCombatCommand(UrlDecodeField(encodedCommand));
     uint32 executed = 0;
 
-    if (IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    BridgeAudience audience;
+    if (IsAllowedCombatCommand(command) && ParseBridgeAudience(scope, target, audience))
     {
-        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
-        {
-            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
-            if (!bot)
-                continue;
-
-            if (!BotMatchesCombatScope(requester, bot, scope, target))
-                continue;
-
-            if (ExecuteSilentBotCommand(requester, bot, command))
-                ++executed;
-        }
+        uint32 seconds = 0;
+        if (ParseWaitForAttackTime(command, seconds))
+            executed = ForEachAudienceBot(requester, audience, [seconds](Player* bot)
+            {
+                return ApplyNativeWaitForAttackTime(bot, seconds);
+            });
+        else
+            executed = ForEachAudienceBot(requester, audience, [requester, &command](Player* bot)
+            {
+                return ExecuteSilentBotCommand(requester, bot, command);
+            });
     }
 
-    std::ostringstream payload;
-    payload << scope
-        << kFieldSeparator << UrlEncodeField(target)
-        << kFieldSeparator << token
-        << kFieldSeparator << executed
-        << kFieldSeparator << UrlEncodeField(command);
-
-    SendAddonPacket(requester, replyType, "COMBAT_ACK", payload.str());
+    SendCommandAck(requester, replyType, "COMBAT_ACK", scope, target, Trim(requestToken), executed, command);
 }
 
-// Mirrors RunCombatCommand exactly, including the scope model -- which is the real prize: `@tank`
-// filtering happens here, against the bots the requester actually commands, and the ack carries how
-// many of them applied it. The chat form could only ever hope.
 void RunStrategyCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
     std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
     std::string const command = ToLower(Trim(UrlDecodeField(encodedCommand)));
     uint32 executed = 0;
 
-    if (IsAllowedStrategyCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
-    {
-        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
+    BridgeAudience audience;
+    if (IsAllowedStrategyCommand(command) && ParseBridgeAudience(scope, target, audience))
+        executed = ForEachAudienceBot(requester, audience, [requester, &command](Player* bot)
         {
-            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
-            if (!bot)
-                continue;
+            return ExecuteSilentBotCommand(requester, bot, command);
+        });
 
-            if (!BotMatchesCombatScope(requester, bot, scope, target))
-                continue;
-
-            if (ExecuteSilentBotCommand(requester, bot, command))
-                ++executed;
-        }
-    }
-
-    std::ostringstream payload;
-    payload << scope
-        << kFieldSeparator << UrlEncodeField(target)
-        << kFieldSeparator << token
-        << kFieldSeparator << executed
-        << kFieldSeparator << UrlEncodeField(command);
-
-    SendAddonPacket(requester, replyType, "STRATEGY_ACK", payload.str());
+    SendCommandAck(requester, replyType, "STRATEGY_ACK", scope, target, Trim(requestToken), executed, command);
 }
 
 void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
     std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
-    std::string const command = NormalizePositionCommand(rawCommand);
+    std::string const command = NormalizePositionCommand(UrlDecodeField(encodedCommand));
     uint32 executed = 0;
 
-    if (IsAllowedPositionCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
-    {
-        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
+    BridgeAudience audience;
+    if (IsAllowedPositionCommand(command) && ParseBridgeAudience(scope, target, audience))
+        executed = ForEachAudienceBot(requester, audience, [&command](Player* bot)
         {
-            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
-            if (!bot)
-                continue;
+            return ApplyNativeDisperseCommand(bot, command);
+        });
 
-            if (!BotMatchesCombatScope(requester, bot, scope, target))
-                continue;
-
-            if (ApplyNativeDisperseCommand(bot, command))
-                ++executed;
-        }
-    }
-
-    std::ostringstream payload;
-    payload << scope
-        << kFieldSeparator << UrlEncodeField(target)
-        << kFieldSeparator << token
-        << kFieldSeparator << executed
-        << kFieldSeparator << UrlEncodeField(command);
-
-    SendAddonPacket(requester, replyType, "POSITION_ACK", payload.str());
+    SendCommandAck(requester, replyType, "POSITION_ACK", scope, target, Trim(requestToken), executed, command);
 }
 
 void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
     std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
-    std::string const command = NormalizeLootCommand(rawCommand);
+    std::string const command = ToLower(Trim(UrlDecodeField(encodedCommand)));
     uint32 executed = 0;
 
-    if (IsAllowedLootCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
-    {
-        for (ObjectGuid const& botGuid : GetBridgeVisibleBotGuids(requester))
+    BridgeAudience audience;
+    if (IsAllowedLootCommand(command) && ParseBridgeAudience(scope, target, audience))
+        executed = ForEachAudienceBot(requester, audience, [requester, &command](Player* bot)
         {
-            Player* const bot = ObjectAccessor::FindPlayer(botGuid);
-            if (!bot)
-                continue;
+            return ExecuteSilentBotCommand(requester, bot, command);
+        });
 
-            if (!BotMatchesCombatScope(requester, bot, scope, target))
-                continue;
-
-            if (ExecuteSilentBotCommand(requester, bot, command))
-                ++executed;
-        }
-    }
-
-    std::ostringstream payload;
-    payload << scope
-        << kFieldSeparator << UrlEncodeField(target)
-        << kFieldSeparator << token
-        << kFieldSeparator << executed
-        << kFieldSeparator << UrlEncodeField(command);
-
-    SendAddonPacket(requester, replyType, "LOOT_ACK", payload.str());
+    SendCommandAck(requester, replyType, "LOOT_ACK", scope, target, Trim(requestToken), executed, command);
 }
 
 // RTSC ("RTS control") is playerbots' click-to-command feature. Its whole chat surface is the
@@ -4556,7 +4733,8 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
     // "nothing was asked" and only 0 of N is evidence about support.
     uint32 considered = 0;
 
-    if (!command.empty() && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    BridgeAudience audience;
+    if (!command.empty() && ParseBridgeAudience(scope, target, audience))
     {
         std::string selector;
         std::string sub;
@@ -4568,7 +4746,7 @@ void RunRTSCCommand(Player* requester, ChatMsg replyType, std::string const& sco
             if (!bot)
                 continue;
 
-            if (!BotMatchesCombatScope(requester, bot, scope, target))
+            if (!BotMatchesAudience(requester, bot, audience))
                 continue;
 
             PlayerbotAI* const botAI = GetBotAI(bot);
@@ -4889,7 +5067,18 @@ std::string JoinStrategies(std::vector<std::string> const& strategies)
     return out.str();
 }
 
-std::string FormatRosterEntry(Player* bot)
+// Role bits for the roster: what playerbots itself thinks this bot is for. The addon used to
+// guess from the talent trees, which is a different answer for a feral druid in cat form, a blood
+// death knight built for damage, or any bot whose role strategy was changed by hand - and it is
+// playerbots' answer, not the talent tree's, that decides whom `@tank` and ROLE~tank reach.
+constexpr uint32 kRosterRoleTank = 1;
+constexpr uint32 kRosterRoleHeal = 2;
+constexpr uint32 kRosterRoleRanged = 4;
+
+constexpr uint32 kRosterFlagInCombat = 1;
+constexpr uint32 kRosterFlagOwnBot = 2;
+
+std::string FormatRosterEntry(Player* requester, Player* bot)
 {
     std::ostringstream out;
     // B5: URL-encode the name so it can never contain the ',' field separator (or any
@@ -4897,6 +5086,35 @@ std::string FormatRosterEntry(Player* bot)
     out << UrlEncodeField(bot->GetName()) << ',' << static_cast<uint32>(bot->getClass()) << ',' << static_cast<uint32>(bot->GetLevel())
         << ',' << static_cast<uint32>(bot->GetMapId()) << ',' << (bot->IsAlive() ? '1' : '0') << ','
         << GetPct(bot->GetHealth(), bot->GetMaxHealth()) << ',' << GetPct(bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA));
+
+    // Fields 8-12, appended: a reader that stops at seven is unaffected.
+    //   role mask, power type, power %, subgroup (1-8, 0 = not in the requester's group), flags
+    uint32 roleMask = 0;
+    if (PlayerbotAI::IsTank(bot))
+        roleMask |= kRosterRoleTank;
+    if (PlayerbotAI::IsHeal(bot))
+        roleMask |= kRosterRoleHeal;
+    if (PlayerbotAI::IsRanged(bot))
+        roleMask |= kRosterRoleRanged;
+
+    // The mana field above is 0 for every warrior, rogue and death knight, which drew as an empty
+    // bar that looked like a bot out of resources. This is the bar the bot actually has.
+    Powers const powerType = bot->getPowerType();
+
+    uint32 subgroup = 0;
+    if (Group* const group = requester ? requester->GetGroup() : nullptr)
+        if (bot->GetGroup() == group)
+            subgroup = static_cast<uint32>(group->GetMemberGroup(bot->GetGUID())) + 1;
+
+    uint32 flags = 0;
+    if (bot->IsInCombat())
+        flags |= kRosterFlagInCombat;
+    if (PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot))
+        if (botAI->GetMaster() == requester)
+            flags |= kRosterFlagOwnBot;
+
+    out << ',' << roleMask << ',' << static_cast<uint32>(powerType) << ','
+        << GetPct(bot->GetPower(powerType), bot->GetMaxPower(powerType)) << ',' << subgroup << ',' << flags;
     return out.str();
 }
 
@@ -4907,7 +5125,7 @@ void SendRosterPackets(Player* player, ChatMsg replyType)
 {
     SendAddonPacket(player, replyType, "ROSTER_BEGIN", "");
     for (Player* const bot : GetBridgeVisibleBots(player))
-        SendAddonPacket(player, replyType, "ROSTER_ITEM", FormatRosterEntry(bot));
+        SendAddonPacket(player, replyType, "ROSTER_ITEM", FormatRosterEntry(player, bot));
     SendAddonPacket(player, replyType, "ROSTER_END", "");
 }
 
@@ -5102,7 +5320,10 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             LOG_INFO(kLogFilter, "MultiBotBridge protocol mismatch: addon={} bridge={} player={}",
                 addonVersion, kProtocolVersion, player->GetName());
 
-        SendAddonPacket(player, replyType, "HELLO_ACK", std::string(kProtocolVersion) + kFieldSeparator + kBridgeName);
+        // The capability list is appended: an addon that reads only `protocol~server` keeps
+        // working, it just sees the list as the tail of the server name.
+        SendAddonPacket(player, replyType, "HELLO_ACK",
+            std::string(kProtocolVersion) + kFieldSeparator + kBridgeName + kFieldSeparator + kCapabilities);
         return true;
     }
 
@@ -5336,6 +5557,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const actionRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const itemRequest = SplitOnce(actionRequest.second, kFieldSeparator);
             RunInventoryItemActionCommand(player, replyType, botRequest.first, tokenRequest.first, actionRequest.first, itemRequest.first, itemRequest.second);
+            return true;
+        }
+
+        if (requestType == "ORDER")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunOrderCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
